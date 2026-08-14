@@ -27,8 +27,6 @@ import csv
 import io
 import json
 import logging
-import re
-import unicodedata
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -40,6 +38,7 @@ from ..clock import SOURCE_TZ, timestamp
 from ..config import CvmConfig
 from ..errors import TransientSourceError
 from ..scope.cnpj import normalize
+from ..text import fold_name
 
 log = logging.getLogger(__name__)
 
@@ -58,9 +57,6 @@ FII_CLASS_MARKER = "FII"
 DEAD_SITUATIONS = frozenset({"cancelado", "liquidado"})
 
 _STATE_FILE = "snapshot.json"
-
-_WHITESPACE = re.compile(r"\s+")
-_PUNCTUATION = re.compile(r"[^\w\s]")
 
 
 @dataclass(frozen=True)
@@ -82,20 +78,6 @@ class RegisteredClass:
     legal_name: str
     situation: str
     class_type: str
-
-
-def fold_name(value: str) -> str:
-    """Fold a legal name for comparison: no accents, no punctuation, no case.
-
-    The registry and Fundos.NET spell the same fund differently often enough
-    that raw equality is useless -- accents, double spaces and stray hyphens all
-    vary between the two. Lives here rather than in the resolver so that the
-    registry can offer name search without importing its own consumer.
-    """
-    stripped = unicodedata.normalize("NFKD", value or "")
-    stripped = "".join(ch for ch in stripped if not unicodedata.combining(ch))
-    stripped = _PUNCTUATION.sub(" ", stripped)
-    return _WHITESPACE.sub(" ", stripped).strip().upper()
 
 
 @dataclass(frozen=True)

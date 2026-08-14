@@ -183,7 +183,13 @@ def execute(config: Config, *, skip_audit: bool = False, dry_run: bool = False) 
     report.window = window
     log.info(
         "run starting",
-        extra={"window": str(window), "retention_days": window.days, "dry_run": dry_run},
+        extra={
+            "window": str(window),
+            "retention_days": window.days,
+            "dry_run": dry_run,
+            "config": str(config.source_path) if config.source_path else "built-in defaults",
+            "formats": ",".join(config.download.formats),
+        },
     )
 
     prepare_roots(config)

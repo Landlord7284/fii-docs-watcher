@@ -176,9 +176,18 @@ class FundsFile:
         if entry is None:
             return False
         changed = False
-        if scope.ticker and str(entry.get("ticker") or "") != scope.ticker:
-            entry["ticker"] = Quoted(scope.ticker)
+
+        current = str(entry.get("ticker") or "")
+        wanted = scope.ticker or ""
+        if wanted != current:
+            if wanted:
+                entry["ticker"] = Quoted(wanted)
+            elif "ticker" in entry:
+                # Clearing removes the key rather than writing an empty string,
+                # so the file keeps looking like something a person wrote.
+                del entry["ticker"]
             changed = True
+
         if str(entry.get("scope") or "") != scope.mode.value:
             entry["scope"] = scope.mode.value
             changed = True

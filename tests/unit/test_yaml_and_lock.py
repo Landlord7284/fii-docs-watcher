@@ -182,6 +182,89 @@ class TestFundsFile:
         assert [p.name for p in tmp_path.iterdir() if p.name.startswith(".")] == []
 
 
+class TestScopeSearch:
+    """`Scope.matches` — how a person finds a fund they registered earlier."""
+
+    def _scope(self) -> Scope:
+        scope = Scope(cnpj="12.005.956/0001-65", ticker="KNRI11")
+        scope.legal_name = "KINEA RENDA IMOBILIÁRIA FUNDO DE INVESTIMENTO IMOBILIÁRIO"
+        scope.entities = [
+            Entity(
+                cnpj="12005956000165",
+                fundosnet_id=21189,
+                fnet_fund_description="KINEA RENDA IMOBILIÁRIA FII",
+            )
+        ]
+        return scope
+
+    def test_matches_by_ticker(self) -> None:
+        assert self._scope().matches("KNRI11")
+        assert self._scope().matches("knri")
+
+    def test_matches_by_a_word_of_the_name(self) -> None:
+        assert self._scope().matches("kinea")
+        assert self._scope().matches("RENDA IMOB")
+
+    def test_accents_do_not_have_to_be_typed(self) -> None:
+        assert self._scope().matches("imobiliaria")
+        assert self._scope().matches("IMOBILIÁRIA")
+
+    def test_matches_by_cnpj_in_any_punctuation(self) -> None:
+        assert self._scope().matches("12005956")
+        assert self._scope().matches("12.005.956/0001-65")
+        assert self._scope().matches("0001-65")
+
+    def test_matches_the_fundos_net_description_too(self) -> None:
+        # An unresolved scope has no legal name, but a resolved one may only be
+        # recognisable by what Fundos.NET calls it.
+        assert self._scope().matches("FII")
+
+    def test_an_empty_query_matches_everything(self) -> None:
+        # `list` with no argument shows all funds.
+        assert self._scope().matches("")
+        assert self._scope().matches("   ")
+
+    def test_an_unrelated_query_does_not_match(self) -> None:
+        assert not self._scope().matches("hedge")
+        assert not self._scope().matches("99999999")
+
+    def test_a_scope_with_nothing_resolved_still_matches_its_cnpj(self) -> None:
+        bare = Scope(cnpj="12.005.956/0001-65")
+        assert bare.matches("12005956")
+        assert not bare.matches("kinea")
+
+
+class TestTickerEditing:
+    def test_a_ticker_can_be_cleared_and_the_key_disappears(self, tmp_path: Path) -> None:
+        path = tmp_path / "funds.yaml"
+        funds = FundsFile.load(path)
+        funds.add_scope(Scope(cnpj="12.005.956/0001-65", ticker="KNRI11"))
+        funds.save()
+
+        again = FundsFile.load(path)
+        scope = again.scopes()[0]
+        scope.ticker = None
+        assert again.update_user_fields(scope)
+        again.save()
+
+        # Removed rather than written as an empty string, so the file still
+        # reads like something a person wrote. (Checked on the mapping key, not
+        # on the word: the template's comment header mentions "ticker" too.)
+        lines = path.read_text(encoding="utf-8").splitlines()
+        assert not [line for line in lines if line.strip().startswith("ticker:")]
+        assert FundsFile.load(path).scopes()[0].ticker is None
+
+    def test_changing_a_ticker_replaces_it(self, tmp_path: Path) -> None:
+        path = tmp_path / "funds.yaml"
+        funds = FundsFile.load(path)
+        funds.add_scope(Scope(cnpj="12.005.956/0001-65", ticker="OLD11"))
+        scope = funds.scopes()[0]
+        scope.ticker = "KNRI11"
+        assert funds.update_user_fields(scope)
+        funds.save()
+        assert FundsFile.load(path).scopes()[0].ticker == "KNRI11"
+
+
 class TestProcessLock:
     def test_a_second_instance_is_refused_while_the_first_holds_it(self, tmp_path: Path) -> None:
         path = tmp_path / "watcher.lock"

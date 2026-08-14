@@ -37,12 +37,13 @@ from dataclasses import dataclass
 from datetime import timedelta
 
 from ..clock import to_dir_name, today
-from ..cvm.registry import RegistryEntity, RegistrySnapshot, fold_name
+from ..cvm.registry import RegistryEntity, RegistrySnapshot
 from ..errors import ScopeResolutionError, TransientSourceError, WatcherError
 from ..fnet import funds as fnet_funds
 from ..fnet.client import FnetClient
 from ..fnet.funds import FundCandidate
 from ..fnet.listing import probe
+from ..text import fold_name
 from .models import Entity, ExpansionState, Scope, ScopeMode
 
 log = logging.getLogger(__name__)

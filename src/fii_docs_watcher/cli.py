@@ -21,7 +21,7 @@ from pathlib import Path
 
 from . import __version__
 from .clock import retention_window, to_dir_name, today
-from .config import Config, load
+from .config import CONFIG_SEARCH_PATH, Config, describe_source, load
 from .cvm.registry import RegistryCache
 from .errors import ConfigError, LockHeldError, WatcherError
 from .fnet.client import FnetClient
@@ -35,6 +35,35 @@ from .scope.resolver import resolve_scope
 from .scope.yaml_store import FundsFile
 
 log = logging.getLogger(__name__)
+
+MAIN_EPILOG = """\
+Typical use:
+
+  cp config.example.toml config.toml     copy and edit the roots
+  fii-docs-watcher doctor                check the environment
+  fii-docs-watcher add --name "kinea"    register a fund
+  fii-docs-watcher run                   do the work (schedule this daily)
+
+  fii-docs-watcher list kinea            find a registered fund
+  fii-docs-watcher ticker kinea          annotate it with a B3 ticker
+  fii-docs-watcher status                what is in the archive
+
+Configuration is discovered automatically, so --config is rarely needed:
+  --config PATH, then $FII_WATCHER_CONFIG, then ./config.toml,
+  ./fii-docs-watcher.toml, ~/.config/fii-docs-watcher/config.toml.
+If none is found the built-in defaults are used and a warning says so.
+
+Any value can be overridden by environment: FII_WATCHER_<SECTION>_<KEY>,
+for example FII_WATCHER_RETENTION_DAYS=14.
+
+Exit codes:
+  0  clean
+  1  ran, but something failed in isolation and was skipped
+  2  invalid configuration or arguments
+  3  another instance holds the lock
+
+Full reference: USAGE.md
+"""
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -62,6 +91,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="fii-docs-watcher",
         description="Download FII documents from Fundos.NET into a sliding N-day archive.",
+        epilog=MAIN_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
         parents=[common],
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -71,16 +102,60 @@ def build_parser() -> argparse.ArgumentParser:
     # before the subcommand. The fallback is applied after parsing instead.
     sub = parser.add_subparsers(dest="command", required=True)
 
-    def add_command(name: str, help_text: str) -> argparse.ArgumentParser:
-        return sub.add_parser(name, help=help_text, parents=[common])
+    def add_command(
+        name: str, help_text: str, description: str = "", epilog: str = ""
+    ) -> argparse.ArgumentParser:
+        # `help` is the one-liner in the command list; `description` is what
+        # `<command> --help` shows. Without the second, each subcommand's own
+        # help page is a bare usage line.
+        return sub.add_parser(
+            name,
+            help=help_text,
+            description=description or help_text,
+            epilog=epilog,
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            parents=[common],
+        )
 
-    run_cmd = add_command("run", "run the pipeline once (the canonical mode)")
+    run_cmd = add_command(
+        "run",
+        "run the pipeline once (the canonical mode)",
+        description=(
+            "Run the whole pipeline once and exit. This is the only command a scheduler\n"
+            "needs; everything else is for setting up and inspecting.\n\n"
+            "In order: reconcile anything a previous run left half-done, refresh the CVM\n"
+            "registry snapshot, resolve any scope that needs it, query the whole retention\n"
+            "window per entity, download what is new, write the inbox index, purge past the\n"
+            "frontier, then run the global audit.\n\n"
+            "Safe to run as often as you like: rediscovering a document updates its status\n"
+            "and never downloads it again."
+        ),
+        epilog=(
+            "Note: this source answers in either ~0.3s or ~60s, so a run with several\n"
+            "entities taking minutes is normal, not stuck. Progress is logged per step."
+        ),
+    )
     run_cmd.add_argument(
         "--dry-run", action="store_true", help="resolve scopes and stop before discovery"
     )
     run_cmd.add_argument("--skip-audit", action="store_true", help="skip the global audit scan")
 
-    add_cmd = add_command("add", "register a fund to monitor")
+    add_cmd = add_command(
+        "add",
+        "register a fund to monitor",
+        description=(
+            "Register a fund by CNPJ, or search for one by name and pick from the matches.\n\n"
+            "You give one CNPJ; the robot works out the rest. Since RCVM 175 a fund's\n"
+            "documents may be filed by its share classes, each with its own CNPJ and its own\n"
+            "Fundos.NET id, so registering a fund CNPJ monitors the fund and its active\n"
+            "classes. Registering a class CNPJ monitors only that class."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  fii-docs-watcher add --cnpj 08.431.747/0001-06 --ticker HGBS11\n"
+            '  fii-docs-watcher add --name "kinea renda"\n'
+        ),
+    )
     group = add_cmd.add_argument_group("identify the fund")
     group.add_argument("--cnpj", help="CNPJ, with or without punctuation")
     group.add_argument("--name", help="partial name; you will be asked to choose")
@@ -94,16 +169,106 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-resolve", action="store_true", help="write the entry without contacting the sources"
     )
 
-    add_command("list", "show configured scopes and their resolved entities")
+    list_cmd = add_command(
+        "list",
+        "show registered funds, optionally narrowed by a search term",
+        description=(
+            "List registered funds with their resolved entities.\n\n"
+            "With a QUERY, only matching funds are shown. The search covers the ticker, the\n"
+            "legal name, the Fundos.NET description and the CNPJ digits, ignoring accents,\n"
+            "case and punctuation."
+        ),
+        epilog="Examples:\n  fii-docs-watcher list\n  fii-docs-watcher list kinea\n"
+        "  fii-docs-watcher list 08431747\n",
+    )
+    list_cmd.add_argument(
+        "query", nargs="?", metavar="QUERY", help="narrow the listing to matching funds"
+    )
 
-    resolve_cmd = add_command("resolve", "re-resolve scopes against the current sources")
+    ticker_cmd = add_command(
+        "ticker",
+        "set or clear the ticker on an already-registered fund",
+        description=(
+            "Attach a B3 ticker to a fund you already registered.\n\n"
+            "The ticker is your annotation: the robot never fills it in or validates it,\n"
+            "because no native source for it exists in CVM or Fundos.NET data. It is used\n"
+            "as the prefix of downloaded filenames.\n\n"
+            "Existing files are never renamed -- a filename records the prefix that was true\n"
+            "when it was downloaded. Only future downloads use the new one."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  fii-docs-watcher ticker kinea              # pick and prompt\n"
+            "  fii-docs-watcher ticker kinea --set KNRI11 # non-interactive\n"
+            "  fii-docs-watcher ticker kinea --clear\n"
+        ),
+    )
+    ticker_cmd.add_argument("query", metavar="QUERY", help="search term identifying the fund")
+    ticker_cmd.add_argument("--set", metavar="TICKER", help="set this ticker without prompting")
+    ticker_cmd.add_argument("--clear", action="store_true", help="remove the ticker")
+
+    resolve_cmd = add_command(
+        "resolve",
+        "re-resolve scopes against the current sources",
+        description=(
+            "Re-run the CNPJ -> entities -> Fundos.NET id resolution and write the result\n"
+            "back to funds.yaml. Refreshes the CVM registry first.\n\n"
+            "Useful after a fund is renamed, after a new share class is created, or when the\n"
+            "audit reports a document that per-entity discovery did not capture."
+        ),
+    )
     resolve_cmd.add_argument("--all", action="store_true", help="re-resolve even resolved scopes")
 
-    add_command("reconcile", "heal intermediate states and sweep stale staging files")
-    add_command("purge", "apply the retention frontier now")
-    add_command("audit", "run the global-listing cross-check now")
-    add_command("status", "summarise the manifest")
-    add_command("doctor", "check the environment before a first run")
+    add_command(
+        "reconcile",
+        "heal intermediate states and sweep stale staging files",
+        description=(
+            "Settle anything an interrupted run left behind, then remove orphaned .part\n"
+            "files. `run` does this automatically at startup; this exposes it on its own.\n\n"
+            "A file whose bytes still validate is adopted into the archive rather than\n"
+            "downloaded again; one that is missing or corrupt goes back into the queue."
+        ),
+    )
+    add_command(
+        "purge",
+        "apply the retention frontier now",
+        description=(
+            "Delete date directories older than today - (N - 1), where N is\n"
+            "[retention].days. `run` does this at the end of every run.\n\n"
+            "Manifest rows are kept and marked purged: knowing a document existed is cheap\n"
+            "and useful, and only the file is temporary."
+        ),
+    )
+    add_command(
+        "audit",
+        "run the global-listing cross-check now",
+        description=(
+            "Scan the global listing and report documents whose fund name matches a\n"
+            "monitored scope but which per-entity discovery did not capture.\n\n"
+            "Detective only. It never files a document -- routing by name is precisely the\n"
+            "silent failure this design exists to avoid -- and never fails the job. A hit\n"
+            "means a scope needs revalidating: a new class, or a stale Fundos.NET id."
+        ),
+    )
+    add_command(
+        "status",
+        "summarise the manifest",
+        description=(
+            "Show the retention window, document counts by state, and any entity whose last\n"
+            "complete scan predates the retention frontier (documents in such a gap were\n"
+            "published and purged without ever being seen, and cannot be recovered)."
+        ),
+    )
+    add_command(
+        "doctor",
+        "check the environment before a first run",
+        description=(
+            "Verify everything a run depends on: which config file was resolved, both roots\n"
+            "writable, staging on the same filesystem as the archive (or `rename` would not\n"
+            "be atomic), the manifest openable, and both sources reachable.\n\n"
+            "Run this first on a new machine."
+        ),
+    )
 
     return parser
 
@@ -115,6 +280,22 @@ def _bootstrap(args: argparse.Namespace) -> Config:
     if getattr(args, "verbose", False):
         config = _with_debug(config)
     configure(config.logging)
+
+    # Announced only now, once logging exists. A defaults-only load is a warning
+    # rather than a note: the built-in roots are `./var/...`, so someone with a
+    # config file elsewhere would otherwise be writing to a different archive
+    # than they think.
+    if config.source_path is None:
+        log.warning(
+            "no config file found; using built-in defaults",
+            extra={
+                "searched": ", ".join(str(p) for p in CONFIG_SEARCH_PATH),
+                "data_root": str(config.paths.data_root),
+                "documents_root": str(config.paths.documents_root),
+            },
+        )
+    else:
+        log.debug("configuration loaded", extra={"config_file": str(config.source_path)})
     return config
 
 
@@ -142,10 +323,19 @@ def cmd_add(config: Config, args: argparse.Namespace) -> int:
     mode = ScopeMode.THIS_ENTITY_ONLY if args.this_entity_only else ScopeMode.FUND_AND_CLASSES
 
     cnpj_input = args.cnpj
+    ticker = args.ticker
     if cnpj_input is None:
         cnpj_input = _choose_by_name(config, args.name)
         if cnpj_input is None:
             return ExitCode.CONFIG
+        # Having just picked a fund by name, being asked for its ticker is the
+        # natural next question. Only when one was not already given, and only
+        # with a terminal present -- a scheduled run must never block on input.
+        if ticker is None and sys.stdin.isatty():
+            try:
+                ticker = input("Ticker (optional, Enter to skip): ").strip() or None
+            except (EOFError, KeyboardInterrupt):
+                ticker = None
 
     normalized = normalize(cnpj_input)
     if normalized is None:
@@ -156,7 +346,7 @@ def cmd_add(config: Config, args: argparse.Namespace) -> int:
         # may legitimately know better than this arithmetic.
         print(f"warning: {format_masked(normalized)} fails the CNPJ check digits", file=sys.stderr)
 
-    scope = Scope(cnpj=cnpj_input, mode=mode, ticker=args.ticker)
+    scope = Scope(cnpj=cnpj_input, mode=mode, ticker=ticker)
 
     if not funds_file.add_scope(scope):
         # Already registered. Re-running `add` to attach a ticker is a natural
@@ -165,8 +355,8 @@ def cmd_add(config: Config, args: argparse.Namespace) -> int:
         if funds_file.update_user_fields(scope):
             funds_file.save(backup=config.paths.funds_backup)
             print(f"{format_masked(normalized)} was already registered; updated it.")
-            if args.ticker:
-                print(f"  ticker set to {args.ticker}")
+            if ticker:
+                print(f"  ticker set to {ticker}")
         else:
             print(f"{format_masked(normalized)} is already registered; nothing to change.")
         return ExitCode.OK
@@ -250,11 +440,17 @@ def _choose_by_name(config: Config, term: str) -> str | None:
     return chosen.cnpj
 
 
-def cmd_list(config: Config, _args: argparse.Namespace) -> int:
+def cmd_list(config: Config, args: argparse.Namespace) -> int:
     funds_file = FundsFile.load(config.paths.funds_file)
-    scopes = funds_file.scopes()
-    if not scopes:
+    all_scopes = funds_file.scopes()
+    if not all_scopes:
         print("No scopes configured. Add one with `fii-docs-watcher add --cnpj ...`.")
+        return ExitCode.OK
+
+    query = getattr(args, "query", None) or ""
+    scopes = [s for s in all_scopes if s.matches(query)]
+    if query and not scopes:
+        print(f"No registered fund matches {query!r}. {len(all_scopes)} registered in total.")
         return ExitCode.OK
 
     for scope in scopes:
@@ -271,6 +467,93 @@ def cmd_list(config: Config, _args: argparse.Namespace) -> int:
                 f"[{confirmed}]  {entity.fnet_fund_description[:56]}"
             )
     print()
+    if query:
+        print(f"showing {len(scopes)} of {len(all_scopes)} registered fund(s)\n")
+    return ExitCode.OK
+
+
+def _select_scope(scopes: list[Scope], query: str) -> Scope | None:
+    """Narrow registered scopes to one, asking the user only when it is ambiguous."""
+    matches = [scope for scope in scopes if scope.matches(query)]
+    if not matches:
+        print(f"No registered fund matches {query!r}.", file=sys.stderr)
+        return None
+    if len(matches) == 1:
+        return matches[0]
+
+    print(f"\n{len(matches)} registered funds match {query!r}:\n")
+    for position, scope in enumerate(matches, start=1):
+        current = f"  ticker={scope.ticker}" if scope.ticker else ""
+        print(
+            f"  {position:2}. {format_masked(scope.cnpj)}  "
+            f"{(scope.legal_name or '(unresolved)')[:58]}{current}"
+        )
+
+    if not sys.stdin.isatty():
+        print(
+            "\nerror: several funds match and there is no terminal to ask on; "
+            "narrow the search term",
+            file=sys.stderr,
+        )
+        return None
+    try:
+        raw = input("\nNumber (blank to cancel): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\nCancelled.", file=sys.stderr)
+        return None
+    if not raw:
+        return None
+    if not raw.isdigit() or not 1 <= int(raw) <= len(matches):
+        print(f"error: {raw!r} is not one of the listed numbers", file=sys.stderr)
+        return None
+    return matches[int(raw) - 1]
+
+
+def cmd_ticker(config: Config, args: argparse.Namespace) -> int:
+    """Set or clear the ticker on an already-registered fund."""
+    funds_file = FundsFile.load(config.paths.funds_file)
+    scopes = funds_file.scopes()
+    if not scopes:
+        print("No scopes configured. Add one with `fii-docs-watcher add --cnpj ...`.")
+        return ExitCode.OK
+
+    scope = _select_scope(scopes, args.query)
+    if scope is None:
+        return ExitCode.CONFIG
+
+    if args.clear:
+        new_ticker = ""
+    elif args.set is not None:
+        new_ticker = args.set.strip()
+    elif sys.stdin.isatty():
+        current = f" [{scope.ticker}]" if scope.ticker else ""
+        try:
+            new_ticker = input(f"Ticker for {scope.label}{current} (blank clears): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nCancelled.", file=sys.stderr)
+            return ExitCode.OK
+    else:
+        print("error: give --set VALUE or --clear when there is no terminal", file=sys.stderr)
+        return ExitCode.CONFIG
+
+    if (scope.ticker or "") == new_ticker:
+        print(f"{scope.label}: ticker unchanged.")
+        return ExitCode.OK
+
+    previous = scope.ticker
+    scope.ticker = new_ticker or None
+    if not funds_file.update_user_fields(scope):
+        print(f"{scope.label}: nothing to change.")
+        return ExitCode.OK
+    funds_file.save(backup=config.paths.funds_backup)
+
+    if scope.ticker:
+        print(f"{format_masked(scope.cnpj)}: ticker {previous or '(none)'} -> {scope.ticker}")
+    else:
+        print(f"{format_masked(scope.cnpj)}: ticker cleared (was {previous})")
+    # Worth saying plainly: the prefix in a filename is a snapshot taken when the
+    # document was downloaded, and old files are never renamed (spec 5.4).
+    print("Existing files keep their old names; only future downloads use the new prefix.")
     return ExitCode.OK
 
 
@@ -391,12 +674,16 @@ def cmd_doctor(config: Config, _args: argparse.Namespace) -> int:
 
     problems: list[str] = []
     print(f"fii-docs-watcher {__version__}")
+    print(f"config:          {describe_source(config)}")
     print(f"timezone:        {SOURCE_TZ} (fixed; independent of the host)")
     print(f"local now:       {now().isoformat(timespec='seconds')}")
     print(f"today:           {to_dir_name(today())}")
     print(f"data root:       {config.paths.data_root}")
     print(f"documents root:  {config.paths.documents_root}")
     print(f"retention:       {config.retention.days} dates")
+    formats = ", ".join(config.download.formats)
+    suffix = "" if config.download.all_formats else "  (other formats are not downloaded)"
+    print(f"formats:         {formats}{suffix}")
     print(f"page length:     {config.source.page_length}")
     print(f"read timeout:    {config.source.read_timeout_seconds}s")
 
@@ -469,9 +756,10 @@ def _print_summary(report: RunReport) -> None:
         )
     if report.downloads:
         f = report.downloads
+        skipped = f"  skipped_by_format={f.skipped}" if f.skipped else ""
         print(
             f"downloads         ok={f.downloaded} failed={f.failed} "
-            f"bytes={f.bytes_written:,}"
+            f"bytes={f.bytes_written:,}{skipped}"
         )
     if report.inbox:
         print(f"inbox             {report.inbox.path} ({report.inbox.documents} document(s))")
@@ -500,6 +788,7 @@ _COMMANDS = {
     "run": cmd_run,
     "add": cmd_add,
     "list": cmd_list,
+    "ticker": cmd_ticker,
     "resolve": cmd_resolve,
     "reconcile": cmd_reconcile,
     "purge": cmd_purge,

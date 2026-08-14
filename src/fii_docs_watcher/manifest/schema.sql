@@ -44,7 +44,11 @@ CREATE TABLE IF NOT EXISTS documents (
     -- last known value, with no promise that it is still current.
     status                TEXT,
 
-    -- discovered | downloading | available | failed | purged
+    -- discovered | downloading | available | failed | purged | skipped
+    --
+    -- `skipped` means the configured [download].formats exclude this document's
+    -- format. It is not a failure and is not retried as one; it is re-evaluated
+    -- each run, so widening the configuration later picks it up.
     local_state           TEXT NOT NULL,
 
     path                  TEXT,

@@ -44,6 +44,20 @@ CRITICAL_FIELDS = (
 STRUCTURED_MARKER = "estruturad"
 
 
+def looks_structured(category: str | None, doc_type: str | None, species: str | None) -> bool:
+    """Predict, from the listing alone, whether a document will arrive as XML.
+
+    A routing hint, never a verdict: it decides what is worth fetching *before*
+    fetching it, and the content signature still has the final say once the
+    bytes arrive. `arquivoEstruturado` would be the obvious flag but comes back
+    as `" "` even for XML, so the category, type and species text are all there
+    is to go on -- and all three matter, because the marker appears in different
+    ones depending on the document.
+    """
+    haystack = f"{category or ''} {doc_type or ''} {species or ''}".lower()
+    return STRUCTURED_MARKER in haystack
+
+
 @dataclass(frozen=True)
 class DocumentRow:
     """One document as the source described it, normalised but not yet fetched."""
@@ -73,14 +87,8 @@ class DocumentRow:
 
     @property
     def looks_structured(self) -> bool:
-        """Whether this is expected to be XML.
-
-        Routing hint only, used to decide what is worth fetching before fetching
-        it. `arquivoEstruturado` would be the obvious flag but arrives as `" "`
-        even for XML documents, so the category and type text are all there is.
-        """
-        haystack = f"{self.category} {self.doc_type} {self.species}".lower()
-        return STRUCTURED_MARKER in haystack
+        """Whether this is expected to be XML. See `looks_structured` above."""
+        return looks_structured(self.category, self.doc_type, self.species)
 
 
 def _text(value: Any) -> str:

@@ -33,6 +33,11 @@ class LocalState(StrEnum):
     AVAILABLE = "available"
     FAILED = "failed"
     PURGED = "purged"
+    # Deliberately not archived: the configured formats exclude this one. Not a
+    # failure -- nothing went wrong -- so it is neither retried nor reported as
+    # an error. Re-evaluated each run, so widening the configuration later picks
+    # these up without a fresh discovery pass.
+    SKIPPED = "skipped"
 
 
 class AttemptOutcome(StrEnum):
@@ -40,6 +45,10 @@ class AttemptOutcome(StrEnum):
     TRANSIENT = "transient"
     INVALID_CONTENT = "invalid_content"
     ERROR = "error"
+    # Downloaded, then declined: the early routing hint mispredicted the format
+    # and the real one is not configured. Worth recording because the request
+    # was really made, and because a mispredict is worth being able to count.
+    FILTERED = "filtered"
 
 
 # States a run may find on startup that mean work was interrupted mid-flight.
@@ -164,10 +173,15 @@ class ManifestRepo:
 
         `failed` is included so a transient failure is retried on the next run;
         the attempts table is where the history of those retries lives.
+
+        `skipped` is included too, so that widening `[download].formats` later
+        picks up what an earlier run declined, with no need to re-discover it.
+        Re-evaluating a still-unwanted document is a local test against its
+        category text and costs no request, so this is cheap to do every run.
         """
         sql = """
             SELECT * FROM documents
-             WHERE local_state IN (?, ?, ?)
+             WHERE local_state IN (?, ?, ?, ?)
                AND purged_at IS NULL
              ORDER BY delivery_date, document_id, version
         """
@@ -175,6 +189,7 @@ class ManifestRepo:
             LocalState.DISCOVERED.value,
             LocalState.DOWNLOADING.value,
             LocalState.FAILED.value,
+            LocalState.SKIPPED.value,
         ]
         if limit is not None:
             sql += " LIMIT ?"

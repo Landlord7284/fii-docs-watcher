@@ -61,6 +61,21 @@ read_timeout_seconds = 180.0
 frequency = "daily"
 
 [download]
+# Which content formats to keep. `downloadDocumento` serves PDF and XML from the
+# same endpoint, so both are archived by default.
+#
+# Naming only one makes the robot decline the other. Where the listing lets the
+# format be predicted (documents whose category or type says "Estruturado" come
+# back as XML) the decision is made *before* the request, so an unwanted format
+# costs no bandwidth at all. If the prediction turns out wrong, the downloaded
+# file is still declined and a warning is logged.
+#
+# Documents declined this way are recorded in the manifest as `skipped`, not
+# lost: widening this list later picks them up on the next run, without needing
+# to rediscover them. Pipeline B is unaffected either way -- it downloads its
+# own XMLs.
+formats = ["pdf", "xml"]
+
 # Remove orphaned .part files older than this during startup reconciliation.
 stale_part_hours = 6
 

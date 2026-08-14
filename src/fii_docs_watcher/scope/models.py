@@ -13,9 +13,11 @@ exactly one entity and the machinery is invisible.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from enum import StrEnum
 
+from ..text import fold_name
 from .cnpj import format_masked, normalize
 
 
@@ -86,6 +88,33 @@ class Scope:
     def label(self) -> str:
         """A short, stable name for logs and CLI output."""
         return self.ticker or self.legal_name or format_masked(self.cnpj) or str(self.cnpj)
+
+    def matches(self, query: str) -> bool:
+        """Does this scope answer to `query`?
+
+        Deliberately broad, because a person looking for a registered fund will
+        reach for whichever handle they remember: the ticker they annotated, a
+        word from the name, or some digits of the CNPJ. Names are folded so an
+        accent-free search still finds `IMOBILIÁRIO`; the CNPJ is matched on
+        bare digits so any punctuation style works.
+        """
+        needle = query.strip()
+        if not needle:
+            return True
+
+        digits = re.sub(r"\D", "", needle)
+        if digits:
+            haystack_digits = [self.normalized_cnpj or ""]
+            haystack_digits += [e.normalized_cnpj or "" for e in self.entities]
+            if any(digits in candidate for candidate in haystack_digits):
+                return True
+
+        folded = fold_name(needle)
+        if not folded:
+            return False
+        fields = [self.ticker or "", self.legal_name or ""]
+        fields += [e.fnet_fund_description for e in self.entities]
+        return any(folded in fold_name(field) for field in fields)
 
     def entity_for_cnpj(self, cnpj: str | None) -> Entity | None:
         """Find the entity a CNPJ belongs to.

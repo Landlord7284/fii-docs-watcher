@@ -215,6 +215,147 @@ class TestCandidateConfirmation:
         assert len([r for r in fake.request_log if "pesquisar" in r]) == 1
 
 
+class TestFormatFilter:
+    """[download].formats — declining a format must cost nothing and lose nothing."""
+
+    def _setup(self, config, fake, formats):
+        """Publish one XML (Estruturado) and one PDF, and return a config wanting `formats`."""
+        from dataclasses import replace
+
+        fake.add_documents(
+            FUND_ID,
+            [
+                make_row(
+                    7001,
+                    category="Informes Periódicos",
+                    doc_type="Informe Mensal Estruturado ",
+                )
+            ],
+        )
+        fake.add_documents(FUND_ID, [make_row(7002, category="Fato Relevante", doc_type="")])
+        fake.payloads[7002] = SAMPLE_PDF
+        fake.content_type[7002] = "application/pdf"
+        fake.disposition[7002] = (
+            'attachment; filename="08431747000106-FRE14082026V01-000007002.pdf"'
+        )
+        return replace(config, download=replace(config.download, formats=formats))
+
+    def test_declining_a_format_costs_no_request(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        pdf_only = self._setup(config, fake, ("pdf",))
+        discover.run(client, repo, scopes, retention_window(7), page_length=200)
+        fake.request_log.clear()
+
+        report = fetch.run(client, repo, pdf_only, scopes)
+
+        assert report.downloaded == 1
+        assert report.skipped == 1
+        downloads = [r for r in fake.request_log if "downloadDocumento" in r]
+        assert len(downloads) == 1, "the declined document must not be requested at all"
+        assert "id=7002" in downloads[0]
+        assert repo.get(7001, 1).local_state == LocalState.SKIPPED
+        assert repo.get(7002, 1).local_state == LocalState.AVAILABLE
+
+    def test_the_converse_selection_works_too(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        xml_only = self._setup(config, fake, ("xml",))
+        discover.run(client, repo, scopes, retention_window(7), page_length=200)
+        fetch.run(client, repo, xml_only, scopes)
+
+        assert repo.get(7001, 1).local_state == LocalState.AVAILABLE
+        assert repo.get(7002, 1).local_state == LocalState.SKIPPED
+
+    def test_a_skipped_document_is_not_written_to_the_archive(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        pdf_only = self._setup(config, fake, ("pdf",))
+        discover.run(client, repo, scopes, retention_window(7), page_length=200)
+        fetch.run(client, repo, pdf_only, scopes)
+
+        archived = [p.name for p in (config.paths.documents_root).rglob("*.xml")]
+        assert archived == []
+
+    def test_widening_the_config_picks_up_what_was_skipped(self, env) -> None:
+        """The point of `skipped` rather than a hard drop."""
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        pdf_only = self._setup(config, fake, ("pdf",))
+        discover.run(client, repo, scopes, retention_window(7), page_length=200)
+        fetch.run(client, repo, pdf_only, scopes)
+        assert repo.get(7001, 1).local_state == LocalState.SKIPPED
+
+        # Later run, both formats wanted, and crucially no fresh discovery.
+        both = self._setup(config, fake, ("pdf", "xml"))
+        report = fetch.run(client, repo, both, scopes)
+
+        assert report.downloaded == 1
+        assert repo.get(7001, 1).local_state == LocalState.AVAILABLE
+
+    def test_re_skipping_stays_free_on_every_later_run(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        pdf_only = self._setup(config, fake, ("pdf",))
+        discover.run(client, repo, scopes, retention_window(7), page_length=200)
+        fetch.run(client, repo, pdf_only, scopes)
+        fake.request_log.clear()
+
+        second = fetch.run(client, repo, pdf_only, scopes)
+
+        assert second.skipped == 1
+        assert [r for r in fake.request_log if "downloadDocumento" in r] == []
+
+    def test_a_mispredicted_format_is_declined_after_download(self, env) -> None:
+        """The signature has the last word, even against the routing hint."""
+        from dataclasses import replace
+
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        # Categorised as Estruturado -- so predicted XML, and wanted -- but the
+        # bytes that come back are a PDF.
+        fake.add_documents(
+            FUND_ID,
+            [
+                make_row(
+                    7100,
+                    category="Informes Periódicos",
+                    doc_type="Informe Mensal Estruturado ",
+                )
+            ],
+        )
+        fake.payloads[7100] = SAMPLE_PDF
+        fake.content_type[7100] = "application/pdf"
+        xml_only = replace(config, download=replace(config.download, formats=("xml",)))
+
+        discover.run(client, repo, scopes, retention_window(7), page_length=200)
+        report = fetch.run(client, repo, xml_only, scopes)
+
+        assert report.downloaded == 0
+        assert report.skipped == 1
+        assert repo.get(7100, 1).local_state == LocalState.SKIPPED
+        assert list(config.paths.documents_root.rglob("*.pdf")) == []
+        # The request really happened, so it is recorded rather than pretended away.
+        assert repo.attempt_count(7100, 1) == 1
+
+    def test_both_formats_is_the_default_and_changes_nothing(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        self._setup(config, fake, ("pdf", "xml"))
+        discover.run(client, repo, scopes, retention_window(7), page_length=200)
+        report = fetch.run(client, repo, config, scopes)
+
+        assert report.downloaded == 2
+        assert report.skipped == 0
+
+
 class TestReconciliation:
     def test_a_file_renamed_but_not_committed_is_adopted_not_redownloaded(self, env) -> None:
         config, fake, repo, scopes, client = env

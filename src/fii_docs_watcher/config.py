@@ -5,10 +5,18 @@ config file has to work, with no orchestrator, no baked-in path, no CNPJ and no
 credential anywhere in the code. Everything the robot needs to find is declared
 here, and every value can be overridden by `FII_WATCHER_<SECTION>_<KEY>` so a
 container can be configured without rewriting the file.
+
+The file is discovered rather than demanded, so the common case needs no flag.
+The one thing that must never happen quietly is falling back to the built-in
+defaults: those point at `./var/...`, and a user whose real config names
+different roots would otherwise operate on an entirely different archive without
+being told. So a fallback is announced, and `Config.source_path` records what
+was actually read.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import tomllib
 from dataclasses import dataclass, field, fields, is_dataclass
@@ -17,12 +25,29 @@ from typing import Any
 
 from .errors import ConfigError
 
+log = logging.getLogger(__name__)
+
 ENV_PREFIX = "FII_WATCHER_"
+
+# Environment variable naming the config file outright, for containers and cron.
+ENV_CONFIG_PATH = f"{ENV_PREFIX}CONFIG"
+
+# Searched in order when no path is given. Relative entries are resolved against
+# the working directory, which is why the project-local names come first: running
+# from a checkout should pick up that checkout's configuration.
+CONFIG_SEARCH_PATH = (
+    Path("config.toml"),
+    Path("fii-docs-watcher.toml"),
+    Path.home() / ".config" / "fii-docs-watcher" / "config.toml",
+)
 
 # Verified ceiling: l=200 is honoured; l>=250 returns HTTP 500 even when the
 # requests are spaced generously, so this is a real server limit rather than
 # rate limiting. Requesting more fails loudly, so clamping here is a courtesy.
 MAX_PAGE_LENGTH = 200
+
+# `downloadDocumento` serves exactly these two, from the same endpoint.
+SUPPORTED_FORMATS = frozenset({"pdf", "xml"})
 
 
 @dataclass(frozen=True)
@@ -102,6 +127,19 @@ class AuditConfig:
 class DownloadConfig:
     stale_part_hours: int = 6
 
+    # Which content formats are worth keeping. Both by default, so the archive
+    # holds everything the funds publish; naming one makes the robot decline the
+    # other. The decision is made before the request wherever the listing allows
+    # it to be predicted, so an unwanted format costs no bandwidth at all.
+    formats: tuple[str, ...] = ("pdf", "xml")
+
+    def wants(self, extension: str) -> bool:
+        return extension.lower().lstrip(".") in self.formats
+
+    @property
+    def all_formats(self) -> bool:
+        return set(self.formats) >= SUPPORTED_FORMATS
+
 
 @dataclass(frozen=True)
 class FilesConfig:
@@ -125,6 +163,10 @@ class Config:
     audit: AuditConfig = field(default_factory=AuditConfig)
     download: DownloadConfig = field(default_factory=DownloadConfig)
     files: FilesConfig = field(default_factory=FilesConfig)
+    # Where these settings came from, or None when the built-in defaults are in
+    # use. Reported by `doctor` and at the start of a run so that "which archive
+    # am I operating on?" is never a guess.
+    source_path: Path | None = None
     logging: LoggingConfig = field(default_factory=LoggingConfig)
 
 
@@ -147,6 +189,16 @@ def _coerce(value: Any, annotation: Any, where: str) -> Any:
         # Dataclass annotations are strings under `from __future__ import annotations`.
         optional = annotation.endswith("| None")
         annotation = annotation.removesuffix(" | None").strip()
+        if annotation.startswith("tuple["):
+            # TOML gives a real array; an environment override can only give a
+            # string, so a comma-separated list is accepted there.
+            if isinstance(value, str):
+                items = [part.strip() for part in value.split(",")]
+            elif isinstance(value, (list, tuple)):
+                items = [str(part).strip() for part in value]
+            else:
+                raise ConfigError(f"{where} must be a list of strings, got {value!r}")
+            return tuple(item.lower() for item in items if item)
         annotation = {
             "Path": Path, "int": int, "float": float, "bool": bool, "str": str,
         }.get(annotation, str)
@@ -184,22 +236,50 @@ def _env_overrides(section: str, keys: set[str]) -> dict[str, str]:
     return out
 
 
-def load(path: Path | str | None = None) -> Config:
-    """Load configuration from `path`, then apply environment overrides.
+def discover(path: Path | str | None = None) -> Path | None:
+    """Resolve which config file to read, or None to use the built-in defaults.
 
-    A missing file is only an error when it was explicitly requested; with no
-    path at all the defaults plus environment are a legitimate configuration.
+    An explicitly requested file that does not exist is an error rather than a
+    silent fallback: the user named it, so failing to find it is a mistake worth
+    reporting, not a cue to use different settings.
+    """
+    if path is not None:
+        candidate = Path(path).expanduser()
+        if not candidate.is_file():
+            raise ConfigError(f"config file not found: {candidate}")
+        return candidate
+
+    from_env = os.environ.get(ENV_CONFIG_PATH)
+    if from_env:
+        candidate = Path(from_env).expanduser()
+        if not candidate.is_file():
+            raise ConfigError(f"{ENV_CONFIG_PATH} points at a missing file: {candidate}")
+        return candidate
+
+    for candidate in CONFIG_SEARCH_PATH:
+        resolved = candidate.expanduser()
+        if resolved.is_file():
+            return resolved
+    return None
+
+
+def load(path: Path | str | None = None) -> Config:
+    """Load configuration, discovering the file when no path is given.
+
+    Falling back to the built-in defaults is legitimate but never silent: those
+    defaults point at `./var/...`, so a user with a real config elsewhere would
+    otherwise be operating on a different archive with no indication.
     """
     raw: dict[str, Any] = {}
-    if path is not None:
-        config_path = Path(path).expanduser()
-        if not config_path.is_file():
-            raise ConfigError(f"config file not found: {config_path}")
+    config_path = discover(path)
+    if config_path is not None:
         try:
             with config_path.open("rb") as fh:
                 raw = tomllib.load(fh)
         except tomllib.TOMLDecodeError as exc:
             raise ConfigError(f"invalid TOML in {config_path}: {exc}") from exc
+        except OSError as exc:
+            raise ConfigError(f"could not read {config_path}: {exc}") from exc
 
     sections: dict[str, Any] = {}
     for name, cls in _SECTIONS.items():
@@ -218,9 +298,23 @@ def load(path: Path | str | None = None) -> Config:
         }
         sections[name] = cls(**kwargs)
 
-    config = Config(**sections)
+    config = Config(**sections, source_path=config_path)
     _validate(config)
+    # Announcing a defaults-only load is left to the caller, which configures
+    # logging immediately after this returns; emitting it here would go out
+    # through the last-resort handler, unformatted and unfiltered.
     return config
+
+
+def describe_source(config: Config) -> str:
+    """One line naming where the settings came from, for logs and `doctor`."""
+    if config.source_path is not None:
+        return str(config.source_path)
+    return (
+        "built-in defaults (no config file found; searched "
+        + ", ".join(str(p) for p in CONFIG_SEARCH_PATH)
+        + ")"
+    )
 
 
 def _validate(config: Config) -> None:
@@ -233,6 +327,17 @@ def _validate(config: Config) -> None:
         raise ConfigError(
             f"[source].page_length is {config.source.page_length}, but the source returns "
             f"HTTP 500 above {MAX_PAGE_LENGTH}"
+        )
+    if not config.download.formats:
+        raise ConfigError(
+            "[download].formats is empty, which would archive nothing; list at least one of "
+            f"{', '.join(sorted(SUPPORTED_FORMATS))}"
+        )
+    unsupported = set(config.download.formats) - SUPPORTED_FORMATS
+    if unsupported:
+        raise ConfigError(
+            f"[download].formats contains {', '.join(sorted(unsupported))}; this source serves "
+            f"only {', '.join(sorted(SUPPORTED_FORMATS))}"
         )
     if config.audit.frequency not in {"daily", "weekly", "never"}:
         raise ConfigError(

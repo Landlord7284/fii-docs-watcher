@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `arquitetura-fii-monitor-pipeline-a-rev3.md` is the architecture and boundary-conditions document (revision 3) for **Pipeline A** — a robot that downloads Brazilian real-estate fund (FII) documents daily from Fundos.NET and files them into per-day directories for human reading, over a sliding N-day retention window.
 
-Pipeline A is implemented in Python 3.12+ under `src/fii_docs_watcher/`, with two dependencies: `httpx` and `ruamel.yaml` (the latter because §3.6 requires comments to survive a rewrite, which PyYAML cannot do). Everything else is standard library. There is still no git repository.
+Pipeline A is implemented in Python 3.12+ under `src/fii_docs_watcher/`, with two dependencies: `httpx` and `ruamel.yaml` (the latter because §3.6 requires comments to survive a rewrite, which PyYAML cannot do). Everything else is standard library.
 
 ```bash
 python -m venv .venv && .venv/bin/pip install -e ".[dev]"
@@ -19,14 +19,20 @@ python -m venv .venv && .venv/bin/pip install -e ".[dev]"
 Running it, once a `config.toml` exists (copy `config.example.toml`):
 
 ```bash
-python -m fii_docs_watcher doctor --config config.toml   # check roots, timezone, both sources
-python -m fii_docs_watcher add    --config config.toml --cnpj 08.431.747/0001-06 --ticker HGBS11
-python -m fii_docs_watcher run    --config config.toml   # the canonical one-shot mode
+python -m fii_docs_watcher doctor    # check config, roots, timezone, both sources
+python -m fii_docs_watcher add --cnpj 08.431.747/0001-06 --ticker HGBS11
+python -m fii_docs_watcher run       # the canonical one-shot mode
 ```
 
-Other subcommands: `list`, `resolve`, `reconcile`, `purge`, `audit`, `status`. `--config` works before or after the subcommand. Exit codes: `0` clean, `1` ran with isolated failures, `2` bad configuration, `3` another instance holds the lock.
+**`USAGE.md` at the repo root is the user-facing command reference** — keep it in step with the CLI.
+
+Other subcommands: `list [QUERY]`, `ticker QUERY`, `resolve`, `reconcile`, `purge`, `audit`, `status`. Exit codes: `0` clean, `1` ran with isolated failures, `2` bad configuration, `3` another instance holds the lock.
+
+The config file is **discovered** — `--config` → `$FII_WATCHER_CONFIG` → `./config.toml` → `./fii-docs-watcher.toml` → `~/.config/fii-docs-watcher/config.toml` → built-in defaults — so the flag is rarely needed and works before or after the subcommand. Falling through to the defaults logs a warning on purpose: they point at `./var/…`, and a silent fallback means operating on a different archive than the one intended.
 
 **Do not lower `[source].read_timeout_seconds` below ~90s.** Successful responses from this host are bimodal — ~0.3s or ~60.3s, nothing between — so a conventional 30s timeout fails roughly half of all *successful* requests.
+
+**`[download].formats`** (default `["pdf", "xml"]`) selects which formats are archived. Naming one declines the other *before the request* wherever the listing allows the format to be predicted; a mispredict is declined after download with a warning. Declined documents are recorded as `skipped` rather than dropped, and `pending_downloads()` re-evaluates them every run, so widening the list picks them up without re-discovery.
 
 ## The spec is the authority
 

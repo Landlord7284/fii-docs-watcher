@@ -26,7 +26,9 @@ python -m fii_docs_watcher run       # the canonical one-shot mode
 
 **`USAGE.md` at the repo root is the user-facing command reference** — keep it in step with the CLI.
 
-Other subcommands: `list [QUERY]`, `ticker QUERY`, `resolve`, `reconcile`, `purge`, `audit`, `status`. Exit codes: `0` clean, `1` ran with isolated failures, `2` bad configuration, `3` another instance holds the lock.
+Other subcommands: `list [QUERY]`, `rm QUERY`, `ticker QUERY`, `resolve`, `reconcile`, `purge`, `audit`, `status`. Exit codes: `0` clean, `1` ran with isolated failures, `2` bad configuration, `3` another instance holds the lock.
+
+**`rm` must stand down the removed fund's backlog.** `discover` stops querying a fund once it leaves `funds.yaml`, but `fetch` builds its queue from the manifest, not from the scope list — so without `abandon_pending()` the next run would keep downloading documents for a fund nobody follows. Files already archived are left to age out through the normal frontier; `--delete-documents` removes them immediately.
 
 The config file is **discovered** — `--config` → `$FII_WATCHER_CONFIG` → `./config.toml` → `./fii-docs-watcher.toml` → `~/.config/fii-docs-watcher/config.toml` → built-in defaults — so the flag is rarely needed and works before or after the subcommand. Falling through to the defaults logs a warning on purpose: they point at `./var/…`, and a silent fallback means operating on a different archive than the one intended.
 

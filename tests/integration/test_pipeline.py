@@ -356,6 +356,115 @@ class TestFormatFilter:
         assert report.skipped == 0
 
 
+class TestRemovingAFund:
+    """`rm` — what has to stop happening once a fund is no longer followed."""
+
+    def test_a_removed_funds_backlog_is_never_downloaded(self, env) -> None:
+        """The bug this guards against.
+
+        `discover` stops asking about a removed fund, but `fetch` builds its
+        queue from the manifest rather than from the scope list. Without
+        standing the backlog down, the next run would keep downloading documents
+        for a fund nobody is following.
+        """
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        fake.add_documents(FUND_ID, [make_row(8001), make_row(8002)])
+        discover.run(client, repo, scopes, retention_window(7), page_length=200)
+        assert len(repo.pending_downloads()) == 2
+
+        abandoned = repo.abandon_pending([FUND_ID])
+
+        assert abandoned == 2
+        assert repo.pending_downloads() == []
+        fake.request_log.clear()
+        report = fetch.run(client, repo, config, [])
+        assert report.downloaded == 0
+        assert [r for r in fake.request_log if "downloadDocumento" in r] == []
+
+    def test_documents_already_on_disk_are_left_alone(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        fake.add_documents(FUND_ID, [make_row(8001)])
+        _cycle(config, repo, scopes, client, retention_window(7))
+        stored = repo.get(8001, 1)
+        assert stored.local_state == LocalState.AVAILABLE
+
+        repo.abandon_pending([FUND_ID])
+
+        # Still archived, and still readable until retention takes it.
+        after = repo.get(8001, 1)
+        assert after.local_state == LocalState.AVAILABLE
+        assert (config.paths.documents_root / after.path).is_file()
+
+    def test_abandoning_is_scoped_to_the_removed_entity(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        other_id = 99999
+        fake.add_documents(FUND_ID, [make_row(8001)])
+        fake.add_documents(other_id, [make_row(8002)])
+        scopes[0].entities[0].fundosnet_id = FUND_ID
+        discover.run(client, repo, scopes, retention_window(7), page_length=200)
+        # Record a document for the other entity directly, as discovery only
+        # covers the monitored one.
+        from fii_docs_watcher.fnet.schema import parse_row
+
+        repo.upsert_discovered(
+            parse_row(make_row(8002)), fundosnet_id=other_id, entity_cnpj=None
+        )
+
+        repo.abandon_pending([FUND_ID])
+
+        assert repo.get(8001, 1).local_state == LocalState.ABANDONED
+        assert repo.get(8002, 1).local_state == LocalState.DISCOVERED
+
+    def test_a_skipped_document_is_abandoned_too(self, env) -> None:
+        # Otherwise it would sit in the queue being re-evaluated forever.
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        fake.add_documents(FUND_ID, [make_row(8001)])
+        discover.run(client, repo, scopes, retention_window(7), page_length=200)
+        repo.set_state(8001, 1, LocalState.SKIPPED)
+
+        assert repo.abandon_pending([FUND_ID]) == 1
+        assert repo.pending_downloads() == []
+
+    def test_deleting_documents_removes_the_files_and_marks_the_rows(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.cli import _delete_documents
+        from fii_docs_watcher.clock import retention_window
+
+        fake.add_documents(FUND_ID, [make_row(8001), make_row(8002)])
+        _cycle(config, repo, scopes, client, retention_window(7))
+        on_disk = repo.available_for_entities([FUND_ID])
+        assert len(on_disk) == 2
+        paths = [config.paths.documents_root / d.path for d in on_disk]
+
+        removed = _delete_documents(config, repo, on_disk)
+
+        assert removed == 2
+        assert not any(p.exists() for p in paths)
+        assert repo.get(8001, 1).local_state == LocalState.PURGED
+        assert repo.get(8001, 1).purged_at is not None
+        # No empty date directory left behind.
+        assert not paths[0].parent.exists()
+
+    def test_available_for_entities_ignores_other_funds(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        fake.add_documents(FUND_ID, [make_row(8001)])
+        _cycle(config, repo, scopes, client, retention_window(7))
+
+        assert len(repo.available_for_entities([FUND_ID])) == 1
+        assert repo.available_for_entities([12345]) == []
+        assert repo.available_for_entities([]) == []
+
+
 class TestReconciliation:
     def test_a_file_renamed_but_not_committed_is_adopted_not_redownloaded(self, env) -> None:
         config, fake, repo, scopes, client = env

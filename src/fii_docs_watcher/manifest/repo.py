@@ -38,6 +38,11 @@ class LocalState(StrEnum):
     # an error. Re-evaluated each run, so widening the configuration later picks
     # these up without a fresh discovery pass.
     SKIPPED = "skipped"
+    # The fund this document belongs to is no longer monitored. Discovered, but
+    # never fetched and never retried, because nobody is following it any more.
+    # Kept rather than deleted: it is still a true record of what the source
+    # published while the fund was being watched.
+    ABANDONED = "abandoned"
 
 
 class AttemptOutcome(StrEnum):
@@ -291,6 +296,74 @@ class ManifestRepo:
              WHERE delivery_date < ? AND purged_at IS NULL
             """,
             (LocalState.PURGED.value, timestamp(), to_dir_name(before)),
+        )
+        return cursor.rowcount
+
+    def abandon_pending(self, fundosnet_ids: Sequence[int]) -> int:
+        """Stop the download queue for entities that are no longer monitored.
+
+        Without this, removing a fund from the watch list would leave its
+        already-discovered backlog in the queue, and the next run would happily
+        download documents for a fund nobody is following any more -- `discover`
+        stops asking about it, but `fetch` works from the manifest, not from the
+        scope list.
+
+        Only pending rows are touched. Anything already on disk stays available
+        and ages out through the normal retention frontier.
+        """
+        if not fundosnet_ids:
+            return 0
+        entity_slots = ",".join("?" * len(fundosnet_ids))
+        cursor = self.connection.execute(
+            f"""
+            UPDATE documents
+               SET local_state = ?
+             WHERE fundosnet_id IN ({entity_slots})
+               AND local_state IN (?, ?, ?, ?)
+               AND purged_at IS NULL
+            """,
+            (
+                LocalState.ABANDONED.value,
+                *fundosnet_ids,
+                LocalState.DISCOVERED.value,
+                LocalState.DOWNLOADING.value,
+                LocalState.FAILED.value,
+                LocalState.SKIPPED.value,
+            ),
+        )
+        return cursor.rowcount
+
+    def available_for_entities(self, fundosnet_ids: Sequence[int]) -> list[ManifestDocument]:
+        """Documents of these entities that are currently on disk."""
+        if not fundosnet_ids:
+            return []
+        slots = ",".join("?" * len(fundosnet_ids))
+        return [
+            ManifestDocument.from_row(row)
+            for row in self.connection.execute(
+                f"""
+                SELECT * FROM documents
+                 WHERE fundosnet_id IN ({slots})
+                   AND local_state = ?
+                   AND purged_at IS NULL
+                 ORDER BY delivery_date, document_id
+                """,
+                (*fundosnet_ids, LocalState.AVAILABLE.value),
+            )
+        ]
+
+    def mark_documents_purged(self, identities: Sequence[tuple[int, int]]) -> int:
+        """Mark specific publications purged, for files removed outside the retention job."""
+        if not identities:
+            return 0
+        now = timestamp()
+        cursor = self.connection.executemany(
+            """
+            UPDATE documents
+               SET local_state = ?, purged_at = ?, path = NULL
+             WHERE document_id = ? AND version = ?
+            """,
+            [(LocalState.PURGED.value, now, doc_id, version) for doc_id, version in identities],
         )
         return cursor.rowcount
 

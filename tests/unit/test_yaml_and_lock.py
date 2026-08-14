@@ -182,6 +182,53 @@ class TestFundsFile:
         assert [p.name for p in tmp_path.iterdir() if p.name.startswith(".")] == []
 
 
+class TestRemoveScope:
+    def test_removing_takes_only_the_named_entry(self, tmp_path: Path) -> None:
+        path = tmp_path / "funds.yaml"
+        path.write_text(AUTHORED, encoding="utf-8")
+        funds = FundsFile.load(path)
+
+        assert funds.remove_scope(Scope(cnpj="08.431.747/0001-06"))
+        funds.save()
+
+        remaining = FundsFile.load(path).scopes()
+        assert [s.normalized_cnpj for s in remaining] == ["34895752000180"]
+
+    def test_the_cnpj_is_matched_however_it_was_typed(self, tmp_path: Path) -> None:
+        path = tmp_path / "funds.yaml"
+        path.write_text(AUTHORED, encoding="utf-8")
+        funds = FundsFile.load(path)
+        # Registered with punctuation, removed without it.
+        assert funds.remove_scope(Scope(cnpj="08431747000106"))
+
+    def test_removing_something_absent_reports_false(self, tmp_path: Path) -> None:
+        path = tmp_path / "funds.yaml"
+        path.write_text(AUTHORED, encoding="utf-8")
+        funds = FundsFile.load(path)
+        assert not funds.remove_scope(Scope(cnpj="11.222.333/0001-81"))
+        assert len(funds.scopes()) == 2
+
+    def test_the_previous_list_survives_as_the_backup(self, tmp_path: Path) -> None:
+        # This is the undo for a removal.
+        path = tmp_path / "funds.yaml"
+        backup = tmp_path / "funds.yaml.bak"
+        path.write_text(AUTHORED, encoding="utf-8")
+        funds = FundsFile.load(path)
+        funds.remove_scope(Scope(cnpj="08.431.747/0001-06"))
+        funds.save(backup=backup)
+
+        assert "08.431.747/0001-06" in backup.read_text(encoding="utf-8")
+        assert "08.431.747/0001-06" not in path.read_text(encoding="utf-8").split("scopes:")[-1]
+
+    def test_the_users_comments_survive_a_removal(self, tmp_path: Path) -> None:
+        path = tmp_path / "funds.yaml"
+        path.write_text(AUTHORED, encoding="utf-8")
+        funds = FundsFile.load(path)
+        funds.remove_scope(Scope(cnpj="34895752000180"))
+        funds.save()
+        assert "keep this comment" in path.read_text(encoding="utf-8")
+
+
 class TestScopeSearch:
     """`Scope.matches` — how a person finds a fund they registered earlier."""
 

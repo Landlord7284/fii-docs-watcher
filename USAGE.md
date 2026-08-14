@@ -143,7 +143,7 @@ Fundos.NET can search by name but never returns a CNPJ. After you pick, it offer
 | `--no-resolve` | Write the entry without contacting the sources; the next `run` resolves it. |
 
 Re-running `add` on a CNPJ that is already registered updates the fields you own rather than
-refusing.
+refusing. To stop following a fund, see [`rm`](#rm-query).
 
 ### `list [QUERY]`
 
@@ -157,6 +157,33 @@ fii-docs-watcher list 08431747
 
 The search covers ticker, legal name, Fundos.NET description and CNPJ digits, ignoring accents,
 case and punctuation.
+
+### `rm QUERY`
+
+Stops following a fund and removes it from the watch list.
+
+```bash
+fii-docs-watcher rm kinea                             # pick, then confirm
+fii-docs-watcher rm 12005956 --yes                    # no prompt
+fii-docs-watcher rm kinea --yes --delete-documents    # also delete its files
+```
+
+`QUERY` searches the same way `list` does. If it matches several funds you are shown a numbered
+list; without a terminal, an ambiguous query is an error rather than a guess.
+
+What happens to what it already collected:
+
+| | Default | With `--delete-documents` |
+|---|---|---|
+| Files in the archive | Left in place; they age out within `retention.days` | Deleted now, and empty date directories are removed |
+| Documents discovered but not yet downloaded | Stood down, never fetched | Same |
+| Manifest rows | Kept | Kept, marked purged |
+
+Manifest rows are kept either way: they are a record of what the source published while you were
+following the fund, and they cost almost nothing.
+
+`--yes` skips the confirmation, which is what you want in a script. The previous watch list is
+saved as `funds.yaml.bak` — that is the undo.
 
 ### `ticker QUERY`
 
@@ -194,7 +221,8 @@ retention frontier — documents in such a gap were published and purged without
 cannot be recovered.
 
 States: `discovered` (queued) · `downloading` (in flight) · `available` (on disk) · `failed` (will
-retry) · `skipped` (not a configured format) · `purged` (aged out; the row is kept, the file is not).
+retry) · `skipped` (not a configured format) · `abandoned` (its fund was removed from the watch
+list) · `purged` (aged out; the row is kept, the file is not).
 
 ### `doctor`
 

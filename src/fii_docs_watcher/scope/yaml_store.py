@@ -165,6 +165,21 @@ class FundsFile:
         self._document[ROOT_KEY].append(entry)
         return True
 
+    def remove_scope(self, scope: Scope) -> bool:
+        """Drop a scope's entry entirely. True if one was found and removed.
+
+        Matched on the normalised CNPJ, so the punctuation the user happened to
+        type is irrelevant. The previous file is kept as `funds.yaml.bak` by the
+        usual save path, which is the undo for this.
+        """
+        target = scope.normalized_cnpj
+        entries = self._document[ROOT_KEY]
+        for index, entry in enumerate(entries):
+            if isinstance(entry, dict) and normalize(entry.get("cnpj")) == target:
+                del entries[index]
+                return True
+        return False
+
     def update_user_fields(self, scope: Scope) -> bool:
         """Apply the fields the user owns to an existing entry. True if anything changed.
 

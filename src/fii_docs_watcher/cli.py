@@ -46,6 +46,7 @@ Typical use:
 
   fii-docs-watcher list kinea            find a registered fund
   fii-docs-watcher ticker kinea          annotate it with a B3 ticker
+  fii-docs-watcher rm kinea              stop following it
   fii-docs-watcher status                what is in the archive
 
 Configuration is discovered automatically, so --config is rarely needed:
@@ -183,6 +184,34 @@ def build_parser() -> argparse.ArgumentParser:
     )
     list_cmd.add_argument(
         "query", nargs="?", metavar="QUERY", help="narrow the listing to matching funds"
+    )
+
+    rm_cmd = add_command(
+        "rm",
+        "stop following a fund and remove it from the watch list",
+        description=(
+            "Remove a fund from the watch list, so it is no longer queried.\n\n"
+            "Documents already in the archive stay where they are by default and age out\n"
+            "through the normal retention window; anything discovered but not yet\n"
+            "downloaded is stood down so it is never fetched. Pass --delete-documents to\n"
+            "remove the archived files immediately instead.\n\n"
+            "Manifest rows are kept either way -- they are a record of what the source\n"
+            "published while you were following the fund, and cost almost nothing.\n\n"
+            "The previous watch list is saved as funds.yaml.bak, which is the undo."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  fii-docs-watcher rm kinea                     # pick, confirm\n"
+            "  fii-docs-watcher rm 12005956 --yes            # no prompt\n"
+            "  fii-docs-watcher rm kinea --yes --delete-documents\n"
+        ),
+    )
+    rm_cmd.add_argument("query", metavar="QUERY", help="search term identifying the fund")
+    rm_cmd.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
+    rm_cmd.add_argument(
+        "--delete-documents",
+        action="store_true",
+        help="also delete this fund's files from the archive now",
     )
 
     ticker_cmd = add_command(
@@ -557,6 +586,113 @@ def cmd_ticker(config: Config, args: argparse.Namespace) -> int:
     return ExitCode.OK
 
 
+def cmd_rm(config: Config, args: argparse.Namespace) -> int:
+    """Stop following a fund: remove it from the watch list."""
+    funds_file = FundsFile.load(config.paths.funds_file)
+    scopes = funds_file.scopes()
+    if not scopes:
+        print("No scopes configured; nothing to remove.")
+        return ExitCode.OK
+
+    scope = _select_scope(scopes, args.query)
+    if scope is None:
+        return ExitCode.CONFIG
+
+    entity_ids = [entity.fundosnet_id for entity in scope.entities]
+    print(f"\n{scope.label}  {format_masked(scope.cnpj)}")
+    if scope.legal_name:
+        print(f"  {scope.legal_name}")
+    print(f"  {len(entity_ids)} monitored entity(ies)")
+
+    # Say what will happen to the documents before asking, because "remove the
+    # fund" and "delete its files" are different things and only one of them is
+    # reversible.
+    connection = connect(config.paths.manifest_file)
+    try:
+        repo = ManifestRepo(connection)
+        on_disk = repo.available_for_entities(entity_ids)
+        print(f"  {len(on_disk)} document(s) currently in the archive")
+        if args.delete_documents:
+            print("  those files WILL BE DELETED (--delete-documents)")
+        else:
+            print(
+                f"  those files stay and age out normally within "
+                f"{config.retention.days} day(s)"
+            )
+
+        if not args.yes:
+            if not sys.stdin.isatty():
+                print(
+                    "\nerror: refusing to remove without confirmation; pass --yes",
+                    file=sys.stderr,
+                )
+                return ExitCode.CONFIG
+            try:
+                answer = input("\nStop following this fund? [y/N] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print("\nCancelled.", file=sys.stderr)
+                return ExitCode.OK
+            if answer not in {"y", "yes"}:
+                print("Cancelled.")
+                return ExitCode.OK
+
+        if not funds_file.remove_scope(scope):
+            print("error: the entry disappeared before it could be removed", file=sys.stderr)
+            return ExitCode.PARTIAL
+        funds_file.save(backup=config.paths.funds_backup)
+
+        # Discovery stops asking about this fund, but the download queue is
+        # built from the manifest, so its backlog has to be stood down too.
+        abandoned = repo.abandon_pending(entity_ids)
+
+        removed_files = 0
+        if args.delete_documents and on_disk:
+            removed_files = _delete_documents(config, repo, on_disk)
+    finally:
+        connection.close()
+
+    print(f"\nRemoved {format_masked(scope.cnpj)} from the watch list.")
+    if abandoned:
+        print(f"  {abandoned} queued document(s) will no longer be downloaded")
+    if args.delete_documents:
+        print(f"  {removed_files} archived file(s) deleted")
+    elif on_disk:
+        print(f"  {len(on_disk)} archived file(s) left in place; they age out with retention")
+    print(f"  a copy of the previous list is in {config.paths.funds_backup}")
+    return ExitCode.OK
+
+
+def _delete_documents(config: Config, repo: ManifestRepo, documents: list) -> int:
+    """Delete archived files for a removed fund, then mark their rows purged."""
+    removed: list[tuple[int, int]] = []
+    touched_dirs: set[Path] = set()
+    for document in documents:
+        if not document.path:
+            continue
+        path = config.paths.documents_root / document.path
+        try:
+            path.unlink(missing_ok=True)
+            touched_dirs.add(path.parent)
+            removed.append((document.document_id, document.version))
+        except OSError as exc:
+            log.error(
+                "could not delete an archived file",
+                extra={"path": str(path), "error": str(exc)},
+            )
+
+    repo.mark_documents_purged(removed)
+
+    # Leave no empty date directories behind, so the archive keeps reading as
+    # "these are the days that have something in them".
+    for directory in touched_dirs:
+        try:
+            if directory.is_dir() and not any(directory.iterdir()):
+                directory.rmdir()
+        except OSError:  # pragma: no cover - a racing writer is fine to ignore
+            pass
+    return len(removed)
+
+
 def cmd_resolve(config: Config, args: argparse.Namespace) -> int:
     funds_file = FundsFile.load(config.paths.funds_file)
     registry = RegistryCache(config.cvm, config.paths.cvm_cache)
@@ -788,6 +924,7 @@ _COMMANDS = {
     "run": cmd_run,
     "add": cmd_add,
     "list": cmd_list,
+    "rm": cmd_rm,
     "ticker": cmd_ticker,
     "resolve": cmd_resolve,
     "reconcile": cmd_reconcile,

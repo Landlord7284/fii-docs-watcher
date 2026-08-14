@@ -44,11 +44,14 @@ CREATE TABLE IF NOT EXISTS documents (
     -- last known value, with no promise that it is still current.
     status                TEXT,
 
-    -- discovered | downloading | available | failed | purged | skipped
+    -- discovered | downloading | available | failed | purged | skipped | abandoned
     --
-    -- `skipped` means the configured [download].formats exclude this document's
-    -- format. It is not a failure and is not retried as one; it is re-evaluated
-    -- each run, so widening the configuration later picks it up.
+    -- `skipped`   the configured [download].formats exclude this document's
+    --             format. Not a failure, not retried as one, and re-evaluated
+    --             each run so widening the configuration later picks it up.
+    -- `abandoned` the fund was removed from the watch list before this document
+    --             was fetched. Never retried; kept as a record of what the
+    --             source published while the fund was still being followed.
     local_state           TEXT NOT NULL,
 
     path                  TEXT,

@@ -121,6 +121,8 @@ Measured against the live source; encoded in the code and pinned by `tests/contr
 
 **§9.2 — `l` is honoured to 200; `l>=250` returns HTTP 500**, even when politely spaced, so it is a real ceiling rather than rate limiting. The endpoint never truncates silently — it either returns exactly what was asked for or errors.
 
+**A small page length is not a cheap query.** `scan()` paginates until the whole window is covered, so `scan(..., page_length=1)` costs *one request per document* — 74 of them for a fund like KINEA RENDA, each able to stall ~60s, and the lot retried if coverage falls short. Combined with the bimodal latency that is an apparent hang, not a slow command. Anything that only needs "does this id exist, and what is it called?" must use `listing.probe()`, which is exactly one request and reads `recordsFiltered` for the total.
+
 **§9.3 — `listarFundos` does expose classes**, each with its own id (`URBANITY CORPORATE` → fund 25256, `CLASSE A` 25257, `CLASSE B` 25258). Two further behaviours the spec does not mention: it pages at **20 results** with a `more` flag, and **the same name can map to several ids** (`CLASSE A DE COTAS DO VBI ULIVING MULTICLASSE` → 1054 *and* 20524), so a candidate is never chosen on a name match alone.
 
 **§9.1 — the listing keeps only the live version.** A document re-filed as v2 returns v2 only; v1 disappears. The v1 file stays on disk and is marked `superseded_at` in the manifest — that history is the point of the archive.

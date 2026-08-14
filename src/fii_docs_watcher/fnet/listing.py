@@ -48,6 +48,18 @@ MAX_SCAN_ATTEMPTS = 3
 
 
 @dataclass
+class ProbeResult:
+    """The answer to "is this id real, and what is it called?" in one request."""
+
+    records_filtered: int = 0
+    first_row: DocumentRow | None = None
+
+    @property
+    def exists(self) -> bool:
+        return self.records_filtered > 0
+
+
+@dataclass
 class ScanResult:
     """Everything one entity-window scan learned, including what went wrong."""
 
@@ -135,6 +147,41 @@ def _pages(
         if not batch or seen >= total or len(batch) < page_length:
             return
         start += page_length
+
+
+def probe(
+    client: FnetClient, *, first: date, last: date, fundosnet_id: int
+) -> ProbeResult:
+    """Confirm an entity id is real, in exactly one request.
+
+    Deliberately not `scan(..., page_length=1)`. A scan paginates until the
+    whole window is covered, so at a page length of one it issues one request
+    per document -- 74 of them for a fund like KINEA RENDA, each able to stall
+    for a minute, and then retries the lot if coverage falls short. Resolving a
+    single fund could take an hour.
+
+    Confirmation needs neither completeness nor coverage: `recordsFiltered`
+    proves the id exists, and the first row carries the exact `descricaoFundo`
+    to store. One page of one row answers both.
+    """
+    payload = client.get(
+        SEARCH_PATH,
+        _search_params(start=0, length=1, first=first, last=last, fundosnet_id=fundosnet_id),
+    ).json()
+    if not isinstance(payload, dict) or "data" not in payload:
+        raise SourceContractError(
+            "search response has no 'data' array",
+            context={"keys": sorted(payload) if isinstance(payload, dict) else type(payload)},
+        )
+    try:
+        total = int(payload.get("recordsFiltered", 0))
+    except (TypeError, ValueError) as exc:
+        raise SourceContractError(
+            f"recordsFiltered is not an integer: {payload.get('recordsFiltered')!r}"
+        ) from exc
+
+    rows, _errors = parse_rows(payload.get("data") or [])
+    return ProbeResult(records_filtered=total, first_row=rows[0] if rows else None)
 
 
 def scan(

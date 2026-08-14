@@ -141,6 +141,30 @@ class TestFundsFile:
         funds.save()
         assert FundsFile.load(path).scopes()[0].ticker == "HGBS11"
 
+    def test_a_ticker_can_be_attached_to_an_already_registered_scope(
+        self, tmp_path: Path
+    ) -> None:
+        # Regression: re-running `add` with --ticker on a known CNPJ reported
+        # "already registered" and silently dropped the ticker.
+        path = tmp_path / "funds.yaml"
+        funds = FundsFile.load(path)
+        funds.add_scope(Scope(cnpj="12.005.956/0001-65"))
+        funds.save()
+
+        again = FundsFile.load(path)
+        assert not again.add_scope(Scope(cnpj="12005956000165", ticker="KNRI11"))
+        assert again.update_user_fields(Scope(cnpj="12005956000165", ticker="KNRI11"))
+        again.save()
+
+        assert FundsFile.load(path).scopes()[0].ticker == "KNRI11"
+
+    def test_updating_user_fields_reports_when_nothing_changed(self, tmp_path: Path) -> None:
+        path = tmp_path / "funds.yaml"
+        funds = FundsFile.load(path)
+        funds.add_scope(Scope(cnpj="12.005.956/0001-65", ticker="KNRI11"))
+        # Same values again: the caller needs to know there is nothing to save.
+        assert not funds.update_user_fields(Scope(cnpj="12005956000165", ticker="KNRI11"))
+
     def test_adding_the_same_cnpj_twice_is_refused(self, tmp_path: Path) -> None:
         path = tmp_path / "funds.yaml"
         funds = FundsFile.load(path)

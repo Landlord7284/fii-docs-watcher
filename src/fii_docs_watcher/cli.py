@@ -31,7 +31,7 @@ from .manifest.repo import ManifestRepo
 from .run import ExitCode, RunReport, execute
 from .scope.cnpj import format_masked, is_valid, normalize
 from .scope.models import Scope, ScopeMode
-from .scope.resolver import find_candidates, resolve_scope
+from .scope.resolver import resolve_scope
 from .scope.yaml_store import FundsFile
 
 log = logging.getLogger(__name__)
@@ -159,7 +159,16 @@ def cmd_add(config: Config, args: argparse.Namespace) -> int:
     scope = Scope(cnpj=cnpj_input, mode=mode, ticker=args.ticker)
 
     if not funds_file.add_scope(scope):
-        print(f"{format_masked(normalized)} is already registered.")
+        # Already registered. Re-running `add` to attach a ticker is a natural
+        # thing to do, so apply what was asked for rather than reporting the
+        # duplicate and dropping the flag on the floor.
+        if funds_file.update_user_fields(scope):
+            funds_file.save(backup=config.paths.funds_backup)
+            print(f"{format_masked(normalized)} was already registered; updated it.")
+            if args.ticker:
+                print(f"  ticker set to {args.ticker}")
+        else:
+            print(f"{format_masked(normalized)} is already registered; nothing to change.")
         return ExitCode.OK
 
     if not args.no_resolve:
@@ -193,28 +202,52 @@ def cmd_add(config: Config, args: argparse.Namespace) -> int:
 
 
 def _choose_by_name(config: Config, term: str) -> str | None:
-    """Interactive disambiguation. Only ever reached from a human at a terminal."""
-    with FnetClient(config.source) as client:
-        candidates = find_candidates(client, term)
+    """Interactive disambiguation, against the CVM registry rather than Fundos.NET.
 
-    if not candidates:
-        print(f"No fund matched {term!r}.", file=sys.stderr)
+    A scope is registered by CNPJ, and Fundos.NET never returns one -- so
+    searching it by name could only ever show the user a list they then had to
+    resolve to a CNPJ themselves. The registry has both fields, and searching it
+    is local: instant, instead of waiting on a source that stalls for a minute
+    at a time.
+    """
+    registry = RegistryCache(config.cvm, config.paths.cvm_cache)
+    snapshot = registry.load(config.source.user_agent)
+    if snapshot is None:
+        print(
+            "error: the CVM registry is unavailable, so names cannot be searched. "
+            "Register by CNPJ instead: --cnpj ...",
+            file=sys.stderr,
+        )
         return None
 
-    print(f"{len(candidates)} match(es) for {term!r}:\n")
-    for position, candidate in enumerate(candidates, start=1):
-        print(f"  {position:2}. [{candidate.fundosnet_id}] {candidate.text}")
+    matches = snapshot.search_by_name(term)
+    if not matches:
+        print(f"No FII fund or class matched {term!r} in the CVM registry.", file=sys.stderr)
+        return None
 
-    print(
-        "\nFundos.NET does not expose a CNPJ here, so pick the fund and then supply its CNPJ\n"
-        "(the CVM registry is what links the two)."
-    )
+    print(f"\n{len(matches)} match(es) for {term!r}:\n")
+    for position, entity in enumerate(matches, start=1):
+        state = "" if entity.active else f"  [{entity.situation}]"
+        print(
+            f"  {position:2}. {format_masked(entity.cnpj)}  {entity.kind:<5} "
+            f"{entity.legal_name[:66]}{state}"
+        )
+
     try:
-        raw = input("\nCNPJ of the fund you want: ").strip()
+        raw = input("\nNumber to register (blank to cancel): ").strip()
     except (EOFError, KeyboardInterrupt):
         print("\nCancelled.", file=sys.stderr)
         return None
-    return raw or None
+
+    if not raw:
+        return None
+    if not raw.isdigit() or not 1 <= int(raw) <= len(matches):
+        print(f"error: {raw!r} is not one of the listed numbers", file=sys.stderr)
+        return None
+
+    chosen = matches[int(raw) - 1]
+    print(f"\nSelected {chosen.legal_name}")
+    return chosen.cnpj
 
 
 def cmd_list(config: Config, _args: argparse.Namespace) -> int:

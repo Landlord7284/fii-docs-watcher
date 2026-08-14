@@ -27,6 +27,8 @@ import csv
 import io
 import json
 import logging
+import re
+import unicodedata
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -57,6 +59,9 @@ DEAD_SITUATIONS = frozenset({"cancelado", "liquidado"})
 
 _STATE_FILE = "snapshot.json"
 
+_WHITESPACE = re.compile(r"\s+")
+_PUNCTUATION = re.compile(r"[^\w\s]")
+
 
 @dataclass(frozen=True)
 class RegisteredFund:
@@ -77,6 +82,20 @@ class RegisteredClass:
     legal_name: str
     situation: str
     class_type: str
+
+
+def fold_name(value: str) -> str:
+    """Fold a legal name for comparison: no accents, no punctuation, no case.
+
+    The registry and Fundos.NET spell the same fund differently often enough
+    that raw equality is useless -- accents, double spaces and stray hyphens all
+    vary between the two. Lives here rather than in the resolver so that the
+    registry can offer name search without importing its own consumer.
+    """
+    stripped = unicodedata.normalize("NFKD", value or "")
+    stripped = "".join(ch for ch in stripped if not unicodedata.combining(ch))
+    stripped = _PUNCTUATION.sub(" ", stripped)
+    return _WHITESPACE.sub(" ", stripped).strip().upper()
 
 
 @dataclass(frozen=True)
@@ -179,6 +198,37 @@ class RegistrySnapshot:
             return entity, [entity]
 
         return None, []
+
+    def search_by_name(self, term: str, *, limit: int = 25) -> list[RegistryEntity]:
+        """Find FII funds and classes whose legal name contains `term`.
+
+        This is what makes registering by name workable: Fundos.NET can search
+        by name but never returns a CNPJ, while a scope is registered *by* CNPJ.
+        The registry has both, and the lookup is local -- no request, no waiting
+        on a source that stalls for a minute at a time.
+
+        Funds come before classes, and active entities before dead ones, because
+        that is the order a person scanning the list wants them in.
+        """
+        needle = fold_name(term)
+        if not needle:
+            return []
+
+        seen: set[str] = set()
+        matches: list[RegistryEntity] = []
+        for fund in self._funds_by_cnpj.values():
+            if needle in fold_name(fund.legal_name):
+                entity = _fund_entity(fund)
+                seen.add(entity.cnpj)
+                matches.append(entity)
+        for klass in self._classes_by_cnpj.values():
+            if klass.cnpj in seen:
+                continue  # Monoclass: the fund already represents it.
+            if needle in fold_name(klass.legal_name):
+                matches.append(_class_entity(klass))
+
+        matches.sort(key=lambda e: (not e.active, e.kind != "fund", e.legal_name))
+        return matches[:limit]
 
     def lookup(self, cnpj: str) -> RegistryEntity | None:
         """Find one entity by CNPJ, whether it is registered as a fund or a class."""

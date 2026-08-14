@@ -159,6 +159,62 @@ class TestDiscoveryAndDownload:
         assert result.incomplete_scans == 0
 
 
+class TestCandidateConfirmation:
+    def test_confirming_a_candidate_costs_exactly_one_request(self, env) -> None:
+        """A confirmation must not paginate, however many documents the fund has.
+
+        Regression: this used to call `scan(..., page_length=1)`, which pages
+        until the whole window is covered -- one request per document. For a
+        large fund that is dozens of sequential requests, each able to stall for
+        a minute and the lot retried on a short scan, so registering a busy fund
+        appeared to hang forever.
+        """
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.fnet.funds import FundCandidate
+        from fii_docs_watcher.scope.resolver import confirm_candidate
+
+        # A fund as busy as KINEA RENDA over the confirmation window.
+        fake.add_documents(
+            FUND_ID, [make_row(3000 + i, delivery=today() - timedelta(days=i % 400))
+                      for i in range(74)]
+        )
+        fake.request_log.clear()
+
+        result = confirm_candidate(client, FundCandidate(FUND_ID, "HEDGE BRASIL SHOPPING"))
+
+        searches = [r for r in fake.request_log if "pesquisar" in r]
+        assert len(searches) == 1, f"expected one request, issued {len(searches)}"
+        assert result.confirmed
+        assert result.document_count == 74  # still learns the true total
+        assert result.fnet_description  # and captures the exact description
+
+    def test_a_candidate_with_no_documents_is_not_rejected(self, env) -> None:
+        # Quiet funds are common; rejecting one would block a valid registration.
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.fnet.funds import FundCandidate
+        from fii_docs_watcher.scope.resolver import confirm_candidate
+
+        result = confirm_candidate(client, FundCandidate(99999, "SOME QUIET FUND"))
+        assert not result.confirmed
+        assert result.document_count == 0
+
+    def test_probe_reads_the_total_without_reading_every_row(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+        from fii_docs_watcher.fnet.listing import probe
+
+        window = retention_window(7)
+        fake.add_documents(FUND_ID, [make_row(4000 + i) for i in range(30)])
+        fake.request_log.clear()
+
+        result = probe(client, first=window.first, last=window.last, fundosnet_id=FUND_ID)
+
+        assert result.exists
+        assert result.records_filtered == 30
+        assert result.first_row is not None
+        assert len([r for r in fake.request_log if "pesquisar" in r]) == 1
+
+
 class TestReconciliation:
     def test_a_file_renamed_but_not_committed_is_adopted_not_redownloaded(self, env) -> None:
         config, fake, repo, scopes, client = env

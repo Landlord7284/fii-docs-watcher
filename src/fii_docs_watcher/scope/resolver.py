@@ -33,18 +33,16 @@ fund is never blocked by machinery meant for multiclass ones.
 from __future__ import annotations
 
 import logging
-import re
-import unicodedata
 from dataclasses import dataclass
 from datetime import timedelta
 
 from ..clock import to_dir_name, today
-from ..cvm.registry import RegistryEntity, RegistrySnapshot
+from ..cvm.registry import RegistryEntity, RegistrySnapshot, fold_name
 from ..errors import ScopeResolutionError, TransientSourceError, WatcherError
 from ..fnet import funds as fnet_funds
 from ..fnet.client import FnetClient
 from ..fnet.funds import FundCandidate
-from ..fnet.listing import scan
+from ..fnet.listing import probe
 from .models import Entity, ExpansionState, Scope, ScopeMode
 
 log = logging.getLogger(__name__)
@@ -54,21 +52,9 @@ log = logging.getLogger(__name__)
 # a perfectly good id look nonexistent.
 CONFIRMATION_LOOKBACK_DAYS = 540
 
-_WHITESPACE = re.compile(r"\s+")
-_PUNCTUATION = re.compile(r"[^\w\s]")
-
-
-def normalize_name(value: str) -> str:
-    """Fold a legal name for comparison: no accents, no punctuation, no case.
-
-    The registry and Fundos.NET spell the same fund differently often enough
-    that raw equality is useless -- accents, double spaces and stray hyphens all
-    vary between the two.
-    """
-    stripped = unicodedata.normalize("NFKD", value or "")
-    stripped = "".join(ch for ch in stripped if not unicodedata.combining(ch))
-    stripped = _PUNCTUATION.sub(" ", stripped)
-    return _WHITESPACE.sub(" ", stripped).strip().upper()
+# Defined alongside the registry so that name search can live there without
+# importing this module; re-exported here because this is where callers expect it.
+normalize_name = fold_name
 
 
 @dataclass
@@ -88,20 +74,19 @@ class ResolvedCandidate:
 def confirm_candidate(client: FnetClient, candidate: FundCandidate) -> ResolvedCandidate:
     """Query a candidate id over a wide window to prove it exists.
 
-    A candidate that returns no documents is not rejected: quiet funds are
-    common, and rejecting one would block a legitimate registration. It is simply
-    left unconfirmed, to be settled by the first download's CNPJ check.
+    One request, via `probe`. A candidate that returns no documents is not
+    rejected: quiet funds are common, and rejecting one would block a legitimate
+    registration. It is simply left unconfirmed, to be settled by the first
+    download's CNPJ check.
     """
     last = today()
     first = last - timedelta(days=CONFIRMATION_LOOKBACK_DAYS)
+    log.info(
+        "confirming a candidate against the listing (one request; the source can take ~60s)",
+        extra={"fundosnet_id": candidate.fundosnet_id, "candidate": candidate.text[:70]},
+    )
     try:
-        result = scan(
-            client,
-            first=first,
-            last=last,
-            fundosnet_id=candidate.fundosnet_id,
-            page_length=1,
-        )
+        result = probe(client, first=first, last=last, fundosnet_id=candidate.fundosnet_id)
     except (TransientSourceError, WatcherError) as exc:
         log.warning(
             "could not confirm a candidate id against the listing",
@@ -109,10 +94,12 @@ def confirm_candidate(client: FnetClient, candidate: FundCandidate) -> ResolvedC
         )
         return ResolvedCandidate(candidate, False, candidate.denomination, 0)
 
-    description = result.rows[0].fund_description if result.rows else candidate.denomination
+    description = (
+        result.first_row.fund_description if result.first_row else candidate.denomination
+    )
     return ResolvedCandidate(
         candidate=candidate,
-        confirmed=bool(result.records_filtered),
+        confirmed=result.exists,
         fnet_description=description,
         document_count=result.records_filtered,
     )
@@ -207,6 +194,16 @@ def resolve_scope(
     scope.cvm_code = anchor.cvm_code
     scope.cvm_status = anchor.situation
 
+    log.info(
+        "resolving scope: %s",
+        anchor.legal_name[:70],
+        extra={
+            "cnpj": scope.cnpj,
+            "entities_to_resolve": len(registry_entities),
+            "kind": anchor.kind,
+        },
+    )
+
     if not anchor.active:
         log.warning(
             "scope's CVM situation is not active; it will still be monitored",
@@ -221,8 +218,15 @@ def resolve_scope(
 
     resolved_entities: list[Entity] = []
     failures = 0
-    for registry_entity in registry_entities:
+    total = len(registry_entities)
+    for position, registry_entity in enumerate(registry_entities, start=1):
         try:
+            log.info(
+                "entity %d/%d: searching Fundos.NET by name",
+                position,
+                total,
+                extra={"entity_cnpj": registry_entity.cnpj},
+            )
             candidates = find_candidates(client, registry_entity.legal_name)
             best = _pick(candidates, registry_entity.legal_name, client)
         except (TransientSourceError, WatcherError) as exc:

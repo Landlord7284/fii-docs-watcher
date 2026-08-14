@@ -165,6 +165,25 @@ class FundsFile:
         self._document[ROOT_KEY].append(entry)
         return True
 
+    def update_user_fields(self, scope: Scope) -> bool:
+        """Apply the fields the user owns to an existing entry. True if anything changed.
+
+        Exists so that re-running `add` on a CNPJ that is already registered can
+        still attach a ticker, instead of reporting "already registered" and
+        silently discarding what was asked for.
+        """
+        entry = self._entry_for(scope)
+        if entry is None:
+            return False
+        changed = False
+        if scope.ticker and str(entry.get("ticker") or "") != scope.ticker:
+            entry["ticker"] = Quoted(scope.ticker)
+            changed = True
+        if str(entry.get("scope") or "") != scope.mode.value:
+            entry["scope"] = scope.mode.value
+            changed = True
+        return changed
+
     def update_scope(self, scope: Scope) -> None:
         """Write a scope's resolved fields back, leaving the user's fields alone."""
         entry = self._entry_for(scope)

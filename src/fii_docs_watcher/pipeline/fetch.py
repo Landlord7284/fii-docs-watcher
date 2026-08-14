@@ -1,0 +1,344 @@
+"""Downloading: a recoverable state machine, because two systems cannot commit together.
+
+The filesystem and SQLite do not form one transaction. If the process dies
+between the rename and the commit there is a perfectly good file on disk that
+the manifest does not know about -- and since idempotency is by manifest, it
+would never be recognised. So the protocol is ordered so that every crash point
+leaves a state the next run can reason about:
+
+    1. record (id, version) as  discovered
+    2. download to  {documents_root}/.tmp/{id}_V{version}.part
+    3. validate the content and hash it
+    4. rename to the final destination
+    5. mark  available  with its path and hash
+
+Crash between 4 and 5 and the file exists while the manifest still says
+`downloading`; startup reconciliation finds it, re-validates it, and promotes
+it. Crash before 4 and an orphaned `.part` is all that is left, which is
+discarded. Idempotency never rests on file existence alone.
+
+The staging directory sits inside the documents root on purpose: `rename` is
+only atomic within one filesystem, and the documents root is frequently a
+different mount from the private data root.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import time
+from contextlib import suppress
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from ..clock import parse_dir_name, to_dir_name
+from ..config import Config
+from ..errors import (
+    CnpjDivergenceError,
+    ContentValidationError,
+    TransientSourceError,
+    WatcherError,
+)
+from ..fnet.client import FnetClient
+from ..fnet.download import fetch as fetch_document
+from ..manifest.repo import AttemptOutcome, LocalState, ManifestDocument, ManifestRepo
+from ..scope.cnpj import format_masked, same
+from ..scope.models import Scope
+from . import naming
+
+log = logging.getLogger(__name__)
+
+# Give up on a document after this many recorded attempts. It stays `failed` in
+# the manifest rather than being retried forever on every run.
+MAX_ATTEMPTS_PER_DOCUMENT = 5
+
+
+@dataclass
+class FetchReport:
+    downloaded: int = 0
+    skipped: int = 0
+    failed: int = 0
+    bytes_written: int = 0
+    cnpj_divergences: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+
+
+class EntityIndex:
+    """Maps a Fundos.NET id back to the scope and entity it came from.
+
+    Needed because the manifest deliberately stores the emitting entity rather
+    than the scope: the scope-to-entities relation belongs in the YAML, and the
+    manifest records only what was observed.
+    """
+
+    def __init__(self, scopes: list[Scope]) -> None:
+        self._by_id: dict[int, tuple[Scope, object]] = {}
+        for scope in scopes:
+            for entity in scope.entities:
+                self._by_id[entity.fundosnet_id] = (scope, entity)
+
+    def get(self, fundosnet_id: int) -> tuple[Scope, object] | None:
+        return self._by_id.get(fundosnet_id)
+
+
+def _ensure_dir(path: Path, mode: int) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    try:
+        path.chmod(mode)
+    except OSError:  # pragma: no cover - the share may not permit chmod
+        log.debug("could not set directory mode", extra={"dir": str(path)})
+
+
+def _check_cnpj(
+    scope: Scope,
+    entity: object,
+    document: ManifestDocument,
+    served_cnpj: str | None,
+    report: FetchReport,
+) -> None:
+    """Close the loop on a resolution that was made by matching text.
+
+    The comparison is against the *queried entity's* CNPJ, never the scope's
+    reference CNPJ: in a multiclass fund a class legitimately has its own CNPJ,
+    and comparing it against the umbrella fund's would report a divergence that
+    does not exist.
+
+    Absence of a CNPJ is not a divergence -- parsing the served filename is
+    best-effort and must never halt the pipeline.
+    """
+    if served_cnpj is None:
+        return
+
+    expected = getattr(entity, "normalized_cnpj", None)
+    if same(served_cnpj, expected):
+        if not getattr(entity, "cnpj_confirmed", False):
+            entity.cnpj_confirmed = True  # type: ignore[attr-defined]
+            log.info(
+                "entity CNPJ confirmed by a downloaded document",
+                extra={
+                    "scope": scope.label,
+                    "fundosnet_id": document.fundosnet_id,
+                    "entity_cnpj": format_masked(expected),
+                },
+            )
+        return
+
+    # It may still belong to a sibling entity of the same scope, which is normal
+    # in a multiclass fund and not a divergence.
+    if scope.entity_for_cnpj(served_cnpj) is not None:
+        log.info(
+            "document was filed under a sibling entity of the same scope",
+            extra={
+                "scope": scope.label,
+                "document_id": document.document_id,
+                "served_cnpj": format_masked(served_cnpj),
+            },
+        )
+        return
+
+    message = (
+        f"{scope.label}: document {document.document_id} was served with CNPJ "
+        f"{format_masked(served_cnpj)}, which matches no entity of this scope "
+        f"(expected {format_masked(expected)})"
+    )
+    report.cnpj_divergences.append(message)
+    raise CnpjDivergenceError(message, context={"document_id": document.document_id})
+
+
+def fetch_one(
+    client: FnetClient,
+    repo: ManifestRepo,
+    config: Config,
+    document: ManifestDocument,
+    index: EntityIndex,
+    report: FetchReport,
+) -> bool:
+    """Download and file one document. Returns True when it lands on disk."""
+    delivery = parse_dir_name(document.delivery_date)
+    if delivery is None:
+        log.error(
+            "document has an unusable delivery date and cannot be filed",
+            extra={"document_id": document.document_id, "value": document.delivery_date},
+        )
+        repo.mark_failed(document.document_id, document.version)
+        return False
+
+    if repo.attempt_count(document.document_id, document.version) >= MAX_ATTEMPTS_PER_DOCUMENT:
+        log.debug(
+            "document has exhausted its attempt budget; leaving it failed",
+            extra={"document_id": document.document_id, "version": document.version},
+        )
+        return False
+
+    found = index.get(document.fundosnet_id)
+    scope, entity = found if found is not None else (None, None)
+
+    repo.set_state(document.document_id, document.version, LocalState.DOWNLOADING)
+    started = time.monotonic()
+
+    try:
+        downloaded = fetch_document(
+            client,
+            document_id=document.document_id,
+            version=document.version,
+            expect_structured=bool(document.category and "estruturad" in document.category.lower()),
+        )
+    except ContentValidationError as exc:
+        duration = int((time.monotonic() - started) * 1000)
+        repo.record_attempt(
+            document.document_id,
+            document.version,
+            outcome=AttemptOutcome.INVALID_CONTENT,
+            duration_ms=duration,
+            error=str(exc),
+        )
+        repo.mark_failed(document.document_id, document.version)
+        report.failed += 1
+        report.errors.append(f"document {document.document_id}: {exc}")
+        log.error(
+            "downloaded content failed validation and was not written",
+            extra={"document_id": document.document_id, "error": str(exc)},
+        )
+        return False
+    except (TransientSourceError, WatcherError) as exc:
+        duration = int((time.monotonic() - started) * 1000)
+        repo.record_attempt(
+            document.document_id,
+            document.version,
+            outcome=AttemptOutcome.TRANSIENT,
+            duration_ms=duration,
+            error=str(exc),
+        )
+        repo.mark_failed(document.document_id, document.version)
+        report.failed += 1
+        report.errors.append(f"document {document.document_id}: {exc}")
+        log.warning(
+            "download failed; it will be retried on a later run",
+            extra={"document_id": document.document_id, "error": str(exc)},
+        )
+        return False
+
+    if scope is not None and entity is not None:
+        try:
+            _check_cnpj(scope, entity, document, downloaded.served.cnpj, report)
+        except CnpjDivergenceError as exc:
+            repo.record_attempt(
+                document.document_id,
+                document.version,
+                outcome=AttemptOutcome.ERROR,
+                size=downloaded.size,
+                error=str(exc),
+            )
+            repo.mark_failed(document.document_id, document.version)
+            report.failed += 1
+            log.critical(
+                "CNPJ divergence: the document was not filed and the resolution is not confirmed",
+                extra={"document_id": document.document_id, "error": str(exc)},
+            )
+            return False
+
+    # The entity CNPJ from the served filename is the only place it appears, so
+    # prefer it over the one that originated the query when it parsed cleanly.
+    entity_cnpj = downloaded.served.cnpj or document.entity_cnpj
+
+    prefix = naming.entity_prefix(
+        ticker=getattr(scope, "ticker", None),
+        fund_description=document.fund_description or "",
+        cnpj=entity_cnpj,
+    )
+    filename = naming.document_filename(
+        prefix=prefix,
+        category=document.category or "",
+        species=document.species or "",
+        document_id=document.document_id,
+        version=document.version,
+        extension=downloaded.extension,
+    )
+
+    target_dir = config.paths.documents_root / to_dir_name(delivery)
+    _ensure_dir(target_dir, config.files.directory_mode)
+    _ensure_dir(config.paths.tmp_dir, config.files.directory_mode)
+
+    part_path = config.paths.tmp_dir / naming.part_filename(document.document_id, document.version)
+    final_path = target_dir / filename
+
+    part_path.write_bytes(downloaded.content)
+    # Set the mode before the rename, so the file is never briefly visible in
+    # the archive with the wrong permissions.
+    with suppress(OSError):
+        os.chmod(part_path, config.files.file_mode)
+
+    # Atomic within the documents root, which is why .tmp lives there.
+    part_path.replace(final_path)
+
+    repo.mark_available(
+        document.document_id,
+        document.version,
+        path=str(final_path.relative_to(config.paths.documents_root)),
+        extension=downloaded.extension,
+        content_hash=downloaded.content_hash,
+    )
+    repo.record_attempt(
+        document.document_id,
+        document.version,
+        outcome=AttemptOutcome.SUCCESS,
+        size=downloaded.size,
+        duration_ms=int((time.monotonic() - started) * 1000),
+    )
+
+    report.downloaded += 1
+    report.bytes_written += downloaded.size
+    log.info(
+        "document filed",
+        extra={
+            "document_id": document.document_id,
+            "version": document.version,
+            "path": str(final_path.relative_to(config.paths.documents_root)),
+            "bytes": downloaded.size,
+        },
+    )
+    return True
+
+
+def run(
+    client: FnetClient,
+    repo: ManifestRepo,
+    config: Config,
+    scopes: list[Scope],
+    *,
+    should_stop: object = None,
+) -> FetchReport:
+    """Download every document still pending. Isolated failures never stop the batch."""
+    report = FetchReport()
+    index = EntityIndex(scopes)
+    pending = repo.pending_downloads()
+
+    if not pending:
+        log.info("nothing pending to download")
+        return report
+
+    log.info("starting downloads", extra={"pending": len(pending)})
+    for document in pending:
+        if callable(should_stop) and should_stop():
+            log.warning(
+                "stopping downloads early on request",
+                extra={
+                    "downloaded": report.downloaded,
+                    "remaining": len(pending) - report.downloaded,
+                },
+            )
+            break
+        try:
+            fetch_one(client, repo, config, document, index, report)
+        except OSError as exc:
+            # Disk full, permissions, a vanished mount: real, and not the
+            # document's fault. Record and continue.
+            report.failed += 1
+            report.errors.append(f"document {document.document_id}: {exc}")
+            log.error(
+                "could not write a document to the archive",
+                extra={"document_id": document.document_id, "error": str(exc)},
+            )
+            repo.mark_failed(document.document_id, document.version)
+
+    return report

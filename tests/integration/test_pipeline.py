@@ -1,0 +1,437 @@
+"""End-to-end tests of one run against an in-process fake of Fundos.NET.
+
+These cover the guarantees that are hard to get right and easy to break:
+idempotency, offline recovery across delivery dates, crash recovery between the
+rename and the commit, the retention frontier, and the CNPJ check.
+"""
+
+from __future__ import annotations
+
+import sys
+from datetime import timedelta
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from conftest import SAMPLE_PDF, FakeFnet, make_row, write_funds_yaml
+from fii_docs_watcher.clock import to_dir_name, today
+from fii_docs_watcher.config import Config
+from fii_docs_watcher.fnet.client import FnetClient
+from fii_docs_watcher.manifest.db import connect
+from fii_docs_watcher.manifest.repo import LocalState, ManifestRepo
+from fii_docs_watcher.pipeline import discover, fetch, inbox, purge, reconcile
+from fii_docs_watcher.run import prepare_roots
+from fii_docs_watcher.scope.yaml_store import FundsFile
+
+CNPJ = "08431747000106"
+FUND_ID = 21348
+
+
+@pytest.fixture
+def env(config: Config, fake_fnet: FakeFnet):
+    """A prepared environment with one resolved scope and a live manifest."""
+    prepare_roots(config)
+    write_funds_yaml(config.paths.funds_file, CNPJ, FUND_ID, ticker="HGBS11")
+    connection = connect(config.paths.manifest_file)
+    repo = ManifestRepo(connection)
+    scopes = FundsFile.load(config.paths.funds_file).scopes()
+    client = FnetClient(config.source, transport=fake_fnet.transport)
+    try:
+        yield config, fake_fnet, repo, scopes, client
+    finally:
+        client.close()
+        connection.close()
+
+
+def _cycle(config, repo, scopes, client, window):
+    """Discovery + fetch, the two stages that move documents onto disk."""
+    d = discover.run(client, repo, scopes, window, page_length=config.source.page_length)
+    f = fetch.run(client, repo, config, scopes)
+    return d, f
+
+
+class TestDiscoveryAndDownload:
+    def test_documents_are_filed_under_their_delivery_date(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        window = retention_window(config.retention.days)
+        two_days_ago = today() - timedelta(days=2)
+        fake.add_documents(
+            FUND_ID,
+            [make_row(1001, delivery=today()), make_row(1002, delivery=two_days_ago)],
+        )
+
+        _cycle(config, repo, scopes, client, window)
+
+        # Not everything dumped into today's directory: the question "what
+        # happened on that day?" has to keep its answer.
+        assert (config.paths.documents_root / to_dir_name(today())).is_dir()
+        assert (config.paths.documents_root / to_dir_name(two_days_ago)).is_dir()
+        assert len(list((config.paths.documents_root / to_dir_name(two_days_ago)).iterdir())) == 1
+
+    def test_a_second_run_downloads_nothing_new(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        window = retention_window(config.retention.days)
+        fake.add_documents(FUND_ID, [make_row(1001), make_row(1002)])
+
+        _, first = _cycle(config, repo, scopes, client, window)
+        assert first.downloaded == 2
+
+        _, second = _cycle(config, repo, scopes, client, window)
+        assert second.downloaded == 0
+        assert repo.counts_by_state() == {LocalState.AVAILABLE.value: 2}
+
+    def test_rediscovery_updates_mutable_fields_without_redownloading(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        window = retention_window(config.retention.days)
+        fake.add_documents(FUND_ID, [make_row(1001, status="Ativo com visualização")])
+        _cycle(config, repo, scopes, client, window)
+        original = repo.get(1001, 1)
+        assert original is not None and original.status == "Ativo com visualização"
+
+        # The source cancels the document after delivery.
+        fake.documents[FUND_ID][0]["descricaoStatus"] = "Cancelado"
+        _, second = _cycle(config, repo, scopes, client, window)
+
+        updated = repo.get(1001, 1)
+        assert updated is not None
+        assert updated.status == "Cancelado"
+        assert second.downloaded == 0
+        # The file is not demoted just because the source changed its mind.
+        assert updated.local_state == LocalState.AVAILABLE
+        assert updated.content_hash == original.content_hash
+
+    def test_a_refiling_is_a_separate_publication_and_supersedes_the_first(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        window = retention_window(config.retention.days)
+        fake.add_documents(FUND_ID, [make_row(1001, version=1)])
+        _cycle(config, repo, scopes, client, window)
+
+        # The listing replaces v1 with v2 -- verified behaviour of the source.
+        fake.documents[FUND_ID] = [make_row(1001, version=2, modality="RE")]
+        fake.payloads[1001] = SAMPLE_PDF
+        fake.content_type[1001] = "application/pdf"
+        fake.disposition[1001] = (
+            'attachment; filename="08431747000106-IFP14082026V02-000001001.pdf"'
+        )
+        d, f = _cycle(config, repo, scopes, client, window)
+
+        assert d.superseded == 1
+        assert f.downloaded == 1
+        v1, v2 = repo.get(1001, 1), repo.get(1001, 2)
+        assert v1 is not None and v2 is not None
+        assert v1.superseded_at is not None
+        # v1's file survives: that history is exactly what the archive is for.
+        assert (config.paths.documents_root / v1.path).is_file()
+        assert (config.paths.documents_root / v2.path).is_file()
+        assert v1.path != v2.path
+
+    def test_the_stable_sort_is_sent_on_every_listing_request(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        fake.add_documents(FUND_ID, [make_row(1001)])
+        discover.run(client, repo, scopes, retention_window(7), page_length=200)
+
+        searches = [r for r in fake.request_log if "pesquisar" in r]
+        assert searches
+        # Without this parameter the source silently drops ~19% of rows while
+        # recordsFiltered still matches. It is not optional.
+        assert all("dataEntrega%5D=asc" in r or "dataEntrega]=asc" in r for r in searches)
+
+    def test_pagination_collects_every_row(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        fake.add_documents(FUND_ID, [make_row(2000 + i) for i in range(45)])
+        result = discover.run(client, repo, scopes, retention_window(7), page_length=10)
+
+        assert result.documents_seen == 45
+        assert result.incomplete_scans == 0
+
+
+class TestReconciliation:
+    def test_a_file_renamed_but_not_committed_is_adopted_not_redownloaded(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        window = retention_window(config.retention.days)
+        fake.add_documents(FUND_ID, [make_row(1001)])
+        _cycle(config, repo, scopes, client, window)
+
+        stored = repo.get(1001, 1)
+        assert stored is not None
+
+        # Simulate the crash: the file is in place, the manifest is not.
+        repo.connection.execute(
+            "UPDATE documents SET local_state = ?, content_hash = NULL, downloaded_at = NULL "
+            "WHERE document_id = 1001",
+            (LocalState.DOWNLOADING.value,),
+        )
+
+        report = reconcile.run(repo, config)
+        assert report.promoted == 1
+        assert report.requeued == 0
+
+        healed = repo.get(1001, 1)
+        assert healed is not None
+        assert healed.local_state == LocalState.AVAILABLE
+        assert healed.content_hash == stored.content_hash
+
+    def test_a_missing_destination_goes_back_to_the_queue(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        window = retention_window(config.retention.days)
+        fake.add_documents(FUND_ID, [make_row(1001)])
+        _cycle(config, repo, scopes, client, window)
+
+        stored = repo.get(1001, 1)
+        assert stored is not None
+        (config.paths.documents_root / stored.path).unlink()
+        repo.connection.execute(
+            "UPDATE documents SET local_state = ? WHERE document_id = 1001",
+            (LocalState.DOWNLOADING.value,),
+        )
+
+        report = reconcile.run(repo, config)
+        assert report.requeued == 1
+        assert repo.get(1001, 1).local_state == LocalState.DISCOVERED
+
+        # And the retry actually recovers it.
+        again = fetch.run(client, repo, config, scopes)
+        assert again.downloaded == 1
+
+    def test_a_corrupted_archived_file_is_not_adopted(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        window = retention_window(config.retention.days)
+        fake.add_documents(FUND_ID, [make_row(1001)])
+        _cycle(config, repo, scopes, client, window)
+
+        stored = repo.get(1001, 1)
+        (config.paths.documents_root / stored.path).write_bytes(b"<html>error</html>")
+        repo.connection.execute(
+            "UPDATE documents SET local_state = ? WHERE document_id = 1001",
+            (LocalState.DOWNLOADING.value,),
+        )
+
+        report = reconcile.run(repo, config)
+        # Existence alone is never evidence; the bytes have to re-validate.
+        assert report.promoted == 0
+        assert report.requeued == 1
+
+    def test_stale_staging_files_are_swept(self, config: Config) -> None:
+        import os
+        import time
+
+        prepare_roots(config)
+        stale = config.paths.tmp_dir / "999_V01.part"
+        stale.write_bytes(b"partial")
+        old = time.time() - config.download.stale_part_hours * 3600 - 60
+        os.utime(stale, (old, old))
+
+        fresh = config.paths.tmp_dir / "888_V01.part"
+        fresh.write_bytes(b"in flight")
+
+        assert reconcile.sweep_staging(config) == 1
+        assert not stale.exists()
+        # A recent one may belong to a run that is still going.
+        assert fresh.exists()
+
+
+class TestRetention:
+    def test_purge_deletes_past_the_frontier_and_keeps_the_rows(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        old = today() - timedelta(days=10)
+        fake.add_documents(
+            FUND_ID, [make_row(1001, delivery=today()), make_row(1002, delivery=old)]
+        )
+        # A wide window first, so the old document actually lands on disk.
+        _cycle(config, repo, scopes, client, retention_window(30))
+        assert (config.paths.documents_root / to_dir_name(old)).is_dir()
+
+        report = purge.run(repo, config, retention_window(7))
+
+        assert report.directories_removed == 1
+        assert not (config.paths.documents_root / to_dir_name(old)).exists()
+        assert (config.paths.documents_root / to_dir_name(today())).is_dir()
+        # The record that it existed is cheap and useful; only the file is temporary.
+        assert report.rows_marked == 1
+        assert repo.get(1002, 1).local_state == LocalState.PURGED
+        assert repo.get(1002, 1).purged_at is not None
+
+    def test_purge_never_touches_directories_it_does_not_recognise(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        prepare_roots(config)
+        notes = config.paths.documents_root / "my-notes"
+        notes.mkdir()
+        (notes / "keep.txt").write_text("mine")
+
+        purge.run(repo, config, retention_window(1))
+
+        assert notes.is_dir()
+        assert (notes / "keep.txt").exists()
+        assert config.paths.inbox_dir.is_dir()
+        assert config.paths.tmp_dir.is_dir()
+
+    def test_the_frontier_is_shared_so_discovery_never_fetches_what_purge_deletes(
+        self, env
+    ) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        window = retention_window(3)
+        fake.add_documents(
+            FUND_ID,
+            [make_row(1000 + i, delivery=today() - timedelta(days=i)) for i in range(8)],
+        )
+        _cycle(config, repo, scopes, client, window)
+        purge.run(repo, config, window)
+
+        surviving = {
+            entry.name
+            for entry in config.paths.documents_root.iterdir()
+            if entry.is_dir() and entry.name not in {".tmp", "_inbox"}
+        }
+        assert surviving == {to_dir_name(d) for d in window.dates()}
+
+
+class TestInbox:
+    def test_the_index_lists_what_arrived_today_across_past_delivery_dates(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        window = retention_window(config.retention.days)
+        # The offline-recovery shape: new arrivals scattered over past dates.
+        fake.add_documents(
+            FUND_ID,
+            [make_row(1000 + i, delivery=today() - timedelta(days=i)) for i in range(3)],
+        )
+        _cycle(config, repo, scopes, client, window)
+
+        report = inbox.run(repo, config, window)
+        assert report.documents == 3
+
+        text = (config.paths.documents_root / report.path).read_text(encoding="utf-8")
+        for offset in range(3):
+            assert to_dir_name(today() - timedelta(days=offset)) in text
+        # Relative links, so the archive stays portable over SMB.
+        assert "](../" in text
+
+    def test_an_empty_day_says_so_rather_than_looking_broken(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        report = inbox.run(repo, config, retention_window(7))
+        text = (config.paths.documents_root / report.path).read_text(encoding="utf-8")
+        assert "Nothing new arrived today" in text
+
+
+class TestFailureIsolation:
+    def test_a_failing_download_does_not_stop_the_others(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        window = retention_window(config.retention.days)
+        fake.add_documents(FUND_ID, [make_row(1001), make_row(1002), make_row(1003)])
+        fake.fail_downloads.add(1002)
+
+        _, report = _cycle(config, repo, scopes, client, window)
+
+        assert report.downloaded == 2
+        assert report.failed == 1
+        assert repo.get(1002, 1).local_state == LocalState.FAILED
+        # The failure is recorded as history, not overwritten on the document row.
+        assert repo.attempt_count(1002, 1) >= 1
+
+    def test_a_failed_document_is_retried_on_the_next_run(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        window = retention_window(config.retention.days)
+        fake.add_documents(FUND_ID, [make_row(1001)])
+        fake.fail_downloads.add(1001)
+        _cycle(config, repo, scopes, client, window)
+        assert repo.get(1001, 1).local_state == LocalState.FAILED
+
+        fake.fail_downloads.clear()
+        _, report = _cycle(config, repo, scopes, client, window)
+        assert report.downloaded == 1
+        assert repo.get(1001, 1).local_state == LocalState.AVAILABLE
+
+    def test_a_document_serving_an_html_error_page_is_never_written(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        window = retention_window(config.retention.days)
+        fake.add_documents(FUND_ID, [make_row(1001)])
+        # HTTP 200 with an HTML body is a real failure mode on this source.
+        fake.payloads[1001] = b"<!DOCTYPE html><html><body>HTTP Status 500</body></html>"
+        fake.content_type[1001] = "text/html"
+
+        _, report = _cycle(config, repo, scopes, client, window)
+
+        assert report.failed == 1
+        assert repo.get(1001, 1).local_state == LocalState.FAILED
+        day_dir = config.paths.documents_root / to_dir_name(today())
+        assert not day_dir.exists() or not list(day_dir.iterdir())
+
+
+class TestCnpjValidation:
+    def test_a_matching_cnpj_confirms_the_entity(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        assert scopes[0].entities[0].cnpj_confirmed is False
+        fake.add_documents(FUND_ID, [make_row(1001)])
+        _cycle(config, repo, scopes, client, retention_window(7))
+        assert scopes[0].entities[0].cnpj_confirmed is True
+
+    def test_a_foreign_cnpj_blocks_the_document_and_is_critical(self, env, caplog) -> None:
+        import logging
+
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        fake.add_documents(FUND_ID, [make_row(1001)])
+        # A CNPJ belonging to no entity of this scope: the resolution was textual,
+        # and this is the check that catches it having gone wrong.
+        fake.disposition[1001] = (
+            'attachment; filename="99999999999999-IFP14082026V01-000001001.xml"'
+        )
+
+        with caplog.at_level(logging.CRITICAL):
+            _, report = _cycle(config, repo, scopes, client, retention_window(7))
+
+        assert report.failed == 1
+        assert report.cnpj_divergences
+        assert repo.get(1001, 1).local_state == LocalState.FAILED
+        assert scopes[0].entities[0].cnpj_confirmed is False
+
+    def test_an_unparseable_served_filename_does_not_block_anything(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        fake.add_documents(FUND_ID, [make_row(1001)])
+        # Best-effort by contract: the pipeline falls back to the queried CNPJ.
+        fake.disposition[1001] = 'attachment; filename="unexpected-name.xml"'
+
+        _, report = _cycle(config, repo, scopes, client, retention_window(7))
+
+        assert report.downloaded == 1
+        assert report.failed == 0

@@ -1,0 +1,81 @@
+# fii-docs-watcher configuration.
+#
+# Every value here can be overridden by an environment variable named
+# FII_WATCHER_<SECTION>_<KEY>, e.g. FII_WATCHER_PATHS_DATA_ROOT.
+# No path, CNPJ or personal preference is ever compiled into the code.
+
+[paths]
+# Private robot state: funds.yaml, manifest.sqlite, watcher.lock, cvm-cache/.
+# MUST live on a filesystem local to the process. SQLite over SMB/NFS has
+# unreliable locking and durability.
+data_root = "./var/data"
+
+# The shareable archive: date directories, _inbox/ and .tmp/.
+# This is the only root that should ever be exported over SMB.
+documents_root = "./var/documents"
+
+[retention]
+# Number of dates kept, including today. first_retained_date = today - (N - 1).
+# The same frontier drives purge, the query window and the _inbox index.
+days = 7
+
+[source]
+base_url = "https://fnet.bmfbovespa.com.br/fnet/publico"
+
+# Identifiable, as courtesy to a public endpoint we do not own.
+user_agent = "fii-docs-watcher/0.1 (+https://github.com/marcowb/fii-docs-watcher)"
+
+# Successful responses from this host are bimodally distributed: they return in
+# ~0.3s or in ~60.3s, with nothing in between. A conventional 30s timeout fails
+# roughly half of all requests. Do not lower this without re-measuring.
+read_timeout_seconds = 120.0
+connect_timeout_seconds = 15.0
+
+# Verified ceiling: l=200 is honoured, l>=250 returns HTTP 500. The endpoint
+# never truncates silently, so exceeding this fails loudly rather than quietly.
+page_length = 200
+
+# Courtesy pause between requests, and retry policy for a source with no SLA.
+min_request_interval_seconds = 1.5
+max_retries = 3
+backoff_base_seconds = 2.0
+backoff_max_seconds = 30.0
+
+# Refuse to buffer a response larger than this (bytes).
+max_response_bytes = 104857600
+
+[cvm]
+# The RCVM 175 registry. One daily ZIP containing registro_fundo.csv,
+# registro_classe.csv and registro_subclasse.csv (latin-1, ';' delimited).
+registry_url = "https://dados.cvm.gov.br/dados/FI/CAD/DADOS/registro_fundo_classe.zip"
+
+# Re-download the snapshot only if the cached one is older than this.
+# Failure to refresh never stops monitoring: already-resolved scopes keep
+# running on the last valid snapshot.
+refresh_interval_hours = 24
+read_timeout_seconds = 180.0
+
+[audit]
+# The global-listing cross-check (detective only, never a discovery path).
+# "daily", "weekly" or "never".
+frequency = "daily"
+
+[download]
+# Remove orphaned .part files older than this during startup reconciliation.
+stale_part_hours = 6
+
+[files]
+# Creation modes for the shared archive. Never inherit the host default: the
+# files have to be readable by whoever mounts the share.
+directory_mode = 0o755
+file_mode = 0o644
+
+[logging]
+# "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"
+level = "INFO"
+
+# "text" or "json"
+format = "text"
+
+# Optional. Logs go to stdout/stderr by default and require no log directory.
+# file = "./var/watcher.log"

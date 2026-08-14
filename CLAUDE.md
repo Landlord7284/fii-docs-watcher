@@ -28,7 +28,13 @@ python -m fii_docs_watcher run       # the canonical one-shot mode
 
 Other subcommands: `list [QUERY]`, `rm QUERY`, `ticker QUERY`, `resolve`, `reconcile`, `purge`, `audit`, `status`. Exit codes: `0` clean, `1` ran with isolated failures, `2` bad configuration, `3` another instance holds the lock.
 
-**`rm` must stand down the removed fund's backlog.** `discover` stops querying a fund once it leaves `funds.yaml`, but `fetch` builds its queue from the manifest, not from the scope list — so without `abandon_pending()` the next run would keep downloading documents for a fund nobody follows. Files already archived are left to age out through the normal frontier; `--delete-documents` removes them immediately.
+**A fund can leave the watch list two ways, and both must stop its backlog.** `discover` stops querying a fund once it leaves `funds.yaml`, but `fetch` builds its queue from the manifest, not from the scope list. Three mechanisms keep that honest:
+
+- `rm` calls `abandon_pending()` for the entities it removes, and `forget_entities()` to drop their `sync_state`;
+- `run.execute` sweeps with `abandon_pending_outside(configured_ids)`, catching a scope edited out of the YAML by hand. It uses the ids of **all** configured scopes, resolved or not, so a fund that merely failed to resolve this run keeps its queue;
+- `fetch.run` defers any pending document whose entity is not among the scopes it was given. That is a correctness guard, not tidiness: `fetch_one` can only run the §3.3 CNPJ check when it knows the entity, so downloading without one would archive a document with that check silently skipped.
+
+Files already archived are left to age out through the normal frontier; `rm --delete-documents` removes them immediately. `stale_watermarks()` takes an entity filter for the same reason — otherwise a deliberately removed fund warns about an unrecoverable gap on every run forever.
 
 The config file is **discovered** — `--config` → `$FII_WATCHER_CONFIG` → `./config.toml` → `./fii-docs-watcher.toml` → `~/.config/fii-docs-watcher/config.toml` → built-in defaults — so the flag is rarely needed and works before or after the subcommand. Falling through to the defaults logs a warning on purpose: they point at `./var/…`, and a silent fallback means operating on a different archive than the one intended.
 

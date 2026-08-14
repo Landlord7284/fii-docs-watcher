@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from datetime import date
 from enum import StrEnum
@@ -115,6 +115,12 @@ class ManifestRepo:
         touched. Everything describing the local copy is deliberately left
         alone, so a document that is rediscovered every day for a week is
         downloaded exactly once.
+
+        The single exception is `abandoned`, which is returned to `discovered`.
+        Being seen again means the fund is on the watch list once more -- only a
+        monitored entity is ever queried -- and a fund that was removed and then
+        re-added would otherwise keep a permanently stranded backlog: discovery
+        would find these rows every run while nothing ever downloaded them.
         """
         now = timestamp()
         cursor = self.connection.execute(
@@ -132,7 +138,13 @@ class ManifestRepo:
                 status           = excluded.status,
                 modality         = excluded.modality,
                 entity_cnpj      = COALESCE(documents.entity_cnpj, excluded.entity_cnpj),
-                seen_at          = excluded.seen_at
+                seen_at          = excluded.seen_at,
+                local_state      = CASE
+                                     WHEN documents.local_state = 'abandoned'
+                                       AND documents.purged_at IS NULL
+                                     THEN 'discovered'
+                                     ELSE documents.local_state
+                                   END
             """,
             (
                 row.document_id,
@@ -333,6 +345,54 @@ class ManifestRepo:
         )
         return cursor.rowcount
 
+    def abandon_pending_outside(self, keep_ids: Collection[int]) -> int:
+        """Stand down the queue for every entity that is no longer configured at all.
+
+        The counterpart to `abandon_pending`, for funds that left `funds.yaml`
+        by being edited out rather than through `rm`. The caller passes the
+        entity ids of *every* configured scope, resolved or not, so an entity
+        that merely failed to resolve this run keeps its backlog -- only one
+        that belongs to no scope at all is treated as removed.
+
+        Passing an empty set is meaningful: it says no fund is configured, so
+        nothing pending has an owner.
+        """
+        keep = tuple(keep_ids)
+        keep_clause = f"AND fundosnet_id NOT IN ({','.join('?' * len(keep))})" if keep else ""
+        cursor = self.connection.execute(
+            f"""
+            UPDATE documents
+               SET local_state = ?
+             WHERE local_state IN (?, ?, ?, ?)
+               AND purged_at IS NULL
+               {keep_clause}
+            """,
+            (
+                LocalState.ABANDONED.value,
+                LocalState.DISCOVERED.value,
+                LocalState.DOWNLOADING.value,
+                LocalState.FAILED.value,
+                LocalState.SKIPPED.value,
+                *keep,
+            ),
+        )
+        return cursor.rowcount
+
+    def forget_entities(self, fundosnet_ids: Sequence[int]) -> int:
+        """Drop the per-entity sync state for entities no longer monitored.
+
+        Only `sync_state` -- the watermark and last error, which mean nothing
+        once nobody follows the fund. The `documents` rows stay: those are the
+        record of what the source published, and that remains true.
+        """
+        if not fundosnet_ids:
+            return 0
+        slots = ",".join("?" * len(fundosnet_ids))
+        cursor = self.connection.execute(
+            f"DELETE FROM sync_state WHERE fundosnet_id IN ({slots})", tuple(fundosnet_ids)
+        )
+        return cursor.rowcount
+
     def available_for_entities(self, fundosnet_ids: Sequence[int]) -> list[ManifestDocument]:
         """Documents of these entities that are currently on disk."""
         if not fundosnet_ids:
@@ -459,21 +519,37 @@ class ManifestRepo:
             (fundosnet_id, message[:2000], timestamp()),
         )
 
-    def stale_watermarks(self, frontier: date) -> list[sqlite3.Row]:
+    def stale_watermarks(
+        self, frontier: date, fundosnet_ids: Collection[int] | None = None
+    ) -> list[sqlite3.Row]:
         """Entities whose last successful scan predates the retention frontier.
 
         Past that point documents were published and purged without ever being
         seen, and no future run can recover them -- so this is reported rather
         than repaired.
+
+        `fundosnet_ids` restricts the answer to entities somebody still
+        monitors. Without it, a fund removed on purpose would keep producing an
+        unrecoverable-gap warning on every run for the rest of time, which is
+        exactly how a warning that matters gets trained out of a reader.
         """
+        params: list[object] = [to_dir_name(frontier)]
+        clause = ""
+        if fundosnet_ids is not None:
+            ids = tuple(fundosnet_ids)
+            if not ids:
+                return []
+            clause = f"AND fundosnet_id IN ({','.join('?' * len(ids))})"
+            params.extend(ids)
         return list(
             self.connection.execute(
-                """
+                f"""
                 SELECT * FROM sync_state
                  WHERE last_window_end IS NOT NULL AND last_window_end < ?
+                 {clause}
                  ORDER BY last_window_end
                 """,
-                (to_dir_name(frontier),),
+                params,
             )
         )
 

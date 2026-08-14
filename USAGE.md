@@ -183,7 +183,30 @@ Manifest rows are kept either way: they are a record of what the source publishe
 following the fund, and they cost almost nothing.
 
 `--yes` skips the confirmation, which is what you want in a script. The previous watch list is
-saved as `funds.yaml.bak` — that is the undo.
+saved as `funds.yaml.bak`, though note that is only one level deep: the next command that writes the
+file overwrites it.
+
+#### Removing a fund by editing `funds.yaml`
+
+Deleting a scope's block by hand does the same thing, and the next `run` notices:
+
+- no new documents are discovered for it — discovery only queries entities in the watch list;
+- its queued-but-not-yet-downloaded documents are **stood down** (`abandoned`), so they are never
+  fetched. Without that they would still be downloaded, because the download queue is built from
+  the manifest rather than from the watch list;
+- files already in the archive stay, and age out through the retention window as usual;
+- its manifest rows stay, as the record of what the source published while you followed it;
+- it stops appearing in watermark-gap warnings, which only concern funds you still follow.
+
+The run summary reports what it stood down:
+
+```
+stood down        4 queued document(s) whose fund left the watch list
+```
+
+A fund that is still in `funds.yaml` but failed to resolve on a given run — say the CVM registry
+was unreachable — keeps its queue. Those documents are reported as `deferred` and are picked up on
+the next run that resolves the fund, so an outage never costs you a backlog.
 
 ### `ticker QUERY`
 

@@ -644,6 +644,9 @@ def cmd_rm(config: Config, args: argparse.Namespace) -> int:
         # Discovery stops asking about this fund, but the download queue is
         # built from the manifest, so its backlog has to be stood down too.
         abandoned = repo.abandon_pending(entity_ids)
+        # The watermark and last error describe monitoring that is over. The
+        # document rows stay: those record what the source actually published.
+        repo.forget_entities(entity_ids)
 
         removed_files = 0
         if args.delete_documents and on_disk:
@@ -774,12 +777,19 @@ def cmd_audit(config: Config, _args: argparse.Namespace) -> int:
 
 def cmd_status(config: Config, _args: argparse.Namespace) -> int:
     window = retention_window(config.retention.days)
+    monitored_ids = {
+        entity.fundosnet_id
+        for scope in FundsFile.load(config.paths.funds_file).scopes()
+        for entity in scope.entities
+    }
     connection = connect(config.paths.manifest_file)
     try:
         repo = ManifestRepo(connection)
         counts = repo.counts_by_state()
         available = repo.available_in_window(window.first, window.last)
-        stale = repo.stale_watermarks(window.first)
+        # Only funds still on the watch list: a gap for a fund you removed on
+        # purpose is not a loss to report.
+        stale = repo.stale_watermarks(window.first, monitored_ids)
     finally:
         connection.close()
 
@@ -884,6 +894,11 @@ def _print_summary(report: RunReport) -> None:
         f"scopes            {report.scopes_resolved} resolved, {report.scopes_failed} failed, "
         f"{report.scopes_total} total"
     )
+    if report.abandoned:
+        print(
+            f"stood down        {report.abandoned} queued document(s) whose fund left the "
+            "watch list"
+        )
     if report.discovery:
         d = report.discovery
         print(
@@ -892,10 +907,14 @@ def _print_summary(report: RunReport) -> None:
         )
     if report.downloads:
         f = report.downloads
-        skipped = f"  skipped_by_format={f.skipped}" if f.skipped else ""
+        extras = ""
+        if f.skipped:
+            extras += f"  skipped_by_format={f.skipped}"
+        if f.deferred:
+            extras += f"  deferred={f.deferred}"
         print(
             f"downloads         ok={f.downloaded} failed={f.failed} "
-            f"bytes={f.bytes_written:,}{skipped}"
+            f"bytes={f.bytes_written:,}{extras}"
         )
     if report.inbox:
         print(f"inbox             {report.inbox.path} ({report.inbox.documents} document(s))")

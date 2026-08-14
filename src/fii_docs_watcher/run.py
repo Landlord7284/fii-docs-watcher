@@ -60,6 +60,8 @@ class RunReport:
     scopes_total: int = 0
     scopes_resolved: int = 0
     scopes_failed: int = 0
+    # Queued documents stood down because their fund left the watch list.
+    abandoned: int = 0
     warnings: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     interrupted: bool = False
@@ -208,6 +210,24 @@ def execute(config: Config, *, skip_audit: bool = False, dry_run: bool = False) 
             with FnetClient(config.source) as client:
                 scopes = sync_scopes(client, funds_file, snapshot, config, report)
 
+                # A fund can leave the watch list by being edited out of
+                # funds.yaml rather than through `rm`, and its backlog would
+                # otherwise keep downloading. This uses *every* configured
+                # scope, resolved or not: an entity that merely failed to
+                # resolve this run is still configured and keeps its queue,
+                # while one that belongs to no scope at all has really gone.
+                configured_ids = {
+                    entity.fundosnet_id
+                    for scope in funds_file.scopes()
+                    for entity in scope.entities
+                }
+                report.abandoned = repo.abandon_pending_outside(configured_ids)
+                if report.abandoned:
+                    log.warning(
+                        "stood down queued documents whose fund is no longer configured",
+                        extra={"documents": report.abandoned},
+                    )
+
                 if not scopes:
                     log.warning(
                         "no usable scopes; add one with `fii-docs-watcher add --cnpj ...`",
@@ -233,7 +253,12 @@ def execute(config: Config, *, skip_audit: bool = False, dry_run: bool = False) 
                     page_length=config.source.page_length,
                     should_stop=lambda: shutdown.requested,
                 )
-                report.warnings.extend(discover.check_watermarks(repo, window))
+                # Scoped to entities somebody still monitors: a gap only means
+                # documents were lost if anyone was following the fund.
+                monitored_ids = {e.fundosnet_id for s in scopes for e in s.entities}
+                report.warnings.extend(
+                    discover.check_watermarks(repo, window, monitored_ids)
+                )
 
                 report.downloads = fetch.run(
                     client, repo, config, scopes, should_stop=lambda: shutdown.requested

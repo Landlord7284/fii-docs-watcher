@@ -465,6 +465,201 @@ class TestRemovingAFund:
         assert repo.available_for_entities([]) == []
 
 
+class TestUnwatchedEntities:
+    """What happens to a fund's queue once nobody is following it.
+
+    Removing a fund by editing funds.yaml is as legitimate as using `rm`, and
+    both have to stop the backlog: `discover` reads the scope list, but `fetch`
+    reads the manifest, so without this the next run keeps downloading for a
+    fund nobody follows -- and does it with the CNPJ check skipped, because
+    `fetch_one` can only run that check when it knows the entity.
+    """
+
+    def test_a_document_with_no_known_entity_is_never_requested(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        fake.add_documents(FUND_ID, [make_row(9001)])
+        discover.run(client, repo, scopes, retention_window(7), page_length=200)
+        fake.request_log.clear()
+
+        # No scopes passed: the entity is unknown to this run.
+        report = fetch.run(client, repo, config, [])
+
+        assert report.downloaded == 0
+        assert report.deferred == 1
+        assert [r for r in fake.request_log if "downloadDocumento" in r] == []
+
+    def test_deferring_leaves_the_state_untouched(self, env) -> None:
+        """A CVM outage must not permanently drop a real backlog."""
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        fake.add_documents(FUND_ID, [make_row(9001)])
+        discover.run(client, repo, scopes, retention_window(7), page_length=200)
+        before = repo.get(9001, 1).local_state
+
+        fetch.run(client, repo, config, [])
+
+        assert repo.get(9001, 1).local_state == before
+
+    def test_the_deferred_document_downloads_once_its_scope_returns(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        fake.add_documents(FUND_ID, [make_row(9001)])
+        discover.run(client, repo, scopes, retention_window(7), page_length=200)
+        fetch.run(client, repo, config, [])
+
+        report = fetch.run(client, repo, config, scopes)
+
+        assert report.downloaded == 1
+        assert report.deferred == 0
+        assert repo.get(9001, 1).local_state == LocalState.AVAILABLE
+
+    def test_a_fund_edited_out_of_the_yaml_has_its_queue_stood_down(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        fake.add_documents(FUND_ID, [make_row(9001), make_row(9002)])
+        discover.run(client, repo, scopes, retention_window(7), page_length=200)
+
+        # No scope in funds.yaml claims this entity any more.
+        assert repo.abandon_pending_outside(set()) == 2
+
+        assert repo.get(9001, 1).local_state == LocalState.ABANDONED
+        assert repo.pending_downloads() == []
+
+    def test_a_configured_but_unresolved_fund_keeps_its_queue(self, env) -> None:
+        """The distinction that makes the sweep safe."""
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        fake.add_documents(FUND_ID, [make_row(9001)])
+        discover.run(client, repo, scopes, retention_window(7), page_length=200)
+
+        # Still configured -- it just did not resolve this run -- so it is
+        # passed as a kept id and must not be abandoned.
+        assert repo.abandon_pending_outside({FUND_ID}) == 0
+        assert repo.get(9001, 1).local_state == LocalState.DISCOVERED
+
+    def test_documents_already_archived_are_not_touched_by_the_sweep(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        fake.add_documents(FUND_ID, [make_row(9001)])
+        _cycle(config, repo, scopes, client, retention_window(7))
+
+        repo.abandon_pending_outside(set())
+
+        assert repo.get(9001, 1).local_state == LocalState.AVAILABLE
+
+
+    def test_re_adding_a_fund_revives_its_abandoned_backlog(self, env) -> None:
+        """Otherwise remove-then-re-add leaves a permanently stranded queue.
+
+        Discovery would keep finding these rows every run while nothing ever
+        downloaded them, so the fund would look monitored and quietly not be.
+        """
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        window = retention_window(7)
+        fake.add_documents(FUND_ID, [make_row(9001)])
+        discover.run(client, repo, scopes, window, page_length=200)
+        repo.abandon_pending_outside(set())
+        assert repo.get(9001, 1).local_state == LocalState.ABANDONED
+
+        # The fund is back on the watch list, so it is queried again.
+        discover.run(client, repo, scopes, window, page_length=200)
+
+        assert repo.get(9001, 1).local_state == LocalState.DISCOVERED
+        assert fetch.run(client, repo, config, scopes).downloaded == 1
+
+    def test_rediscovery_does_not_disturb_any_other_state(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        window = retention_window(7)
+        fake.add_documents(FUND_ID, [make_row(9001), make_row(9002)])
+        _cycle(config, repo, scopes, client, window)
+        repo.mark_failed(9002, 1)
+
+        discover.run(client, repo, scopes, window, page_length=200)
+
+        # available stays available, failed stays failed and keeps retrying.
+        assert repo.get(9001, 1).local_state == LocalState.AVAILABLE
+        assert repo.get(9002, 1).local_state == LocalState.FAILED
+
+    def test_a_purged_document_is_not_revived(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        window = retention_window(7)
+        fake.add_documents(FUND_ID, [make_row(9001)])
+        discover.run(client, repo, scopes, window, page_length=200)
+        repo.abandon_pending_outside(set())
+        repo.mark_documents_purged([(9001, 1)])
+
+        discover.run(client, repo, scopes, window, page_length=200)
+
+        assert repo.get(9001, 1).local_state == LocalState.PURGED
+
+
+class TestWatermarkWarnings:
+    def _stale(self, repo, fundosnet_id: int) -> None:
+        from fii_docs_watcher.clock import to_dir_name, today
+
+        repo.advance_watermark(fundosnet_id, today() - timedelta(days=90))
+        assert repo.watermark(fundosnet_id)["last_window_end"] == to_dir_name(
+            today() - timedelta(days=90)
+        )
+
+    def test_a_gap_is_reported_for_a_monitored_fund(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        self._stale(repo, FUND_ID)
+
+        warnings = discover.check_watermarks(repo, retention_window(7), {FUND_ID})
+
+        assert len(warnings) == 1
+        assert str(FUND_ID) in warnings[0]
+
+    def test_no_gap_is_reported_for_a_fund_nobody_follows(self, env) -> None:
+        # Otherwise removing a fund on purpose warns on every run forever, and a
+        # warning that always fires is one nobody reads when it matters.
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        self._stale(repo, FUND_ID)
+
+        assert discover.check_watermarks(repo, retention_window(7), set()) == []
+        assert discover.check_watermarks(repo, retention_window(7), {12345}) == []
+
+    def test_without_a_filter_every_entity_is_still_considered(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        self._stale(repo, FUND_ID)
+
+        assert len(discover.check_watermarks(repo, retention_window(7))) == 1
+
+    def test_forgetting_an_entity_drops_only_its_sync_state(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        fake.add_documents(FUND_ID, [make_row(9001)])
+        _cycle(config, repo, scopes, client, retention_window(7))
+        assert repo.watermark(FUND_ID) is not None
+
+        assert repo.forget_entities([FUND_ID]) == 1
+
+        assert repo.watermark(FUND_ID) is None
+        # The document record survives: it is still true that this was published.
+        assert repo.get(9001, 1) is not None
+
+
 class TestReconciliation:
     def test_a_file_renamed_but_not_committed_is_adopted_not_redownloaded(self, env) -> None:
         config, fake, repo, scopes, client = env

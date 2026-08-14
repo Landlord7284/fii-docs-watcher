@@ -23,6 +23,7 @@ because the next run scans the whole window regardless.
 from __future__ import annotations
 
 import logging
+from collections.abc import Collection
 from dataclasses import dataclass, field
 
 from ..clock import RetentionWindow
@@ -174,14 +175,22 @@ def run(
     return report
 
 
-def check_watermarks(repo: ManifestRepo, window: RetentionWindow) -> list[str]:
+def check_watermarks(
+    repo: ManifestRepo,
+    window: RetentionWindow,
+    monitored_ids: Collection[int] | None = None,
+) -> list[str]:
     """Report entities whose last complete scan predates the retention frontier.
 
     Beyond that frontier documents were published and purged without ever being
     seen. Nothing can recover them, so this is a warning rather than a repair.
+
+    `monitored_ids` limits it to funds somebody still follows. A fund removed on
+    purpose would otherwise raise this every run forever, and a warning that
+    always fires is a warning nobody reads when it finally matters.
     """
     warnings: list[str] = []
-    for row in repo.stale_watermarks(window.first):
+    for row in repo.stale_watermarks(window.first, monitored_ids):
         message = (
             f"entity {row['fundosnet_id']} last completed a scan through "
             f"{row['last_window_end']}, before the retention frontier "

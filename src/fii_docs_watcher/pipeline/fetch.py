@@ -58,6 +58,9 @@ MAX_ATTEMPTS_PER_DOCUMENT = 5
 class FetchReport:
     downloaded: int = 0
     skipped: int = 0
+    # Pending, but their fund is not in the current watch list, so they were
+    # left untouched rather than fetched.
+    deferred: int = 0
     failed: int = 0
     bytes_written: int = 0
     cnpj_divergences: list[str] = field(default_factory=list)
@@ -330,6 +333,17 @@ def fetch_one(
     return True
 
 
+def _partition_by_entity(
+    pending: list[ManifestDocument], index: EntityIndex
+) -> tuple[list[ManifestDocument], list[ManifestDocument]]:
+    """Split pending documents into those with a known owning entity and the rest."""
+    known: list[ManifestDocument] = []
+    orphaned: list[ManifestDocument] = []
+    for document in pending:
+        (known if index.get(document.fundosnet_id) is not None else orphaned).append(document)
+    return known, orphaned
+
+
 def _partition_by_format(
     pending: list[ManifestDocument], config: Config
 ) -> tuple[list[ManifestDocument], list[ManifestDocument]]:
@@ -372,7 +386,30 @@ def run(
     """Download every document still pending. Isolated failures never stop the batch."""
     report = FetchReport()
     index = EntityIndex(scopes)
-    wanted, declined = _partition_by_format(repo.pending_downloads(), config)
+
+    # A document whose entity is not among the scopes handed to this run is
+    # deferred, not fetched. Two reasons, and the second is the important one:
+    # its fund may simply have left funds.yaml, and downloading for a fund
+    # nobody follows is pointless -- but more than that, `fetch_one` can only
+    # run the section 3.3 CNPJ check when it knows the entity, so fetching
+    # without one would archive a document with that check silently skipped.
+    #
+    # Deferring rather than abandoning is deliberate: `run` passes only the
+    # scopes that resolved, so an entity can be missing merely because the CVM
+    # registry was unreachable. Permanent removal is settled in `run.execute`,
+    # which can tell the two apart.
+    known, orphaned = _partition_by_entity(repo.pending_downloads(), index)
+    if orphaned:
+        report.deferred = len(orphaned)
+        log.info(
+            "documents deferred: their fund is not in the current watch list",
+            extra={
+                "deferred": len(orphaned),
+                "entities": sorted({d.fundosnet_id for d in orphaned}),
+            },
+        )
+
+    wanted, declined = _partition_by_format(known, config)
 
     # Declining happens before any request. Section 2.5 sanctions the
     # "Estruturado" text as an early routing hint for exactly this purpose:

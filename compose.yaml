@@ -1,32 +1,13 @@
 services:
   watcher:
     image: ghcr.io/landlord7284/fii-docs-watcher:${IMAGE_TAG:-latest}
-    # To build from a checkout instead of pulling, comment the line above and
-    # uncomment this one.
-    # build: .
     restart: unless-stopped
     init: true
     env_file: .env
-    # No `user:` here on purpose. PUID/PGID come from .env and the entrypoint
-    # applies them itself, because a named volume takes its ownership from the
-    # image and `user:` alone would leave an arbitrary uid unable to write to
-    # it. The container drops to that uid before doing any work.
     volumes:
-      # The robot's settings. Copy config.example.toml here and edit it; the
-      # container never writes to it.
       - ./config.toml:/config/config.toml:ro
-      # Private state: the SQLite manifest, funds.yaml, the lock and the CVM
-      # cache. A named volume because this must be a local filesystem -- SQLite
-      # in WAL mode and flock are both unreliable over SMB or NFS.
       - fii-data:/data
-      # The archive, and the only root meant to be shared. It has to be a
-      # single mount: the robot stages downloads in .tmp/ inside it so that the
-      # final rename stays atomic, and refuses to start if that lands on a
-      # different filesystem. Never mount .tmp/ or a date directory separately.
       - ${DOCUMENTS_PATH:-./documents}:/documents
-    # A single request to the source can take 60 seconds, and shutdown finishes
-    # the step in flight before releasing the lock.
     stop_grace_period: 180s
-
 volumes:
   fii-data:

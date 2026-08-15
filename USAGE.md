@@ -69,6 +69,7 @@ FII_WATCHER_DOWNLOAD_FORMATS=xml fii-docs-watcher run
 | `retention.days` | `7` | Dates kept, **including today**. `N=7` on the 14th keeps the 8th to the 14th. |
 | `download.formats` | `["pdf", "xml"]` | Which formats to keep. See [Choosing formats](#choosing-formats). |
 | `download.stale_part_hours` | `6` | Age at which an orphaned `.part` file is swept. |
+| `source.timezone` | `America/Sao_Paulo` | The zone the source publishes in, and therefore what "today" means for directory names, the retention frontier and the index. Never read from the host. The default is correct for Fundos.NET; changing it on an existing archive re-dates everything downloaded afterwards. |
 | `source.read_timeout_seconds` | `120` | **Do not lower below ~90.** See [Why runs are slow](#why-runs-are-slow). |
 | `source.page_length` | `200` | Listing page size. 200 is the server's ceiling; above it returns HTTP 500. |
 | `source.min_request_interval_seconds` | `1.5` | Courtesy pause between requests. |

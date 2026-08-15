@@ -22,6 +22,21 @@ days = 7
 [source]
 base_url = "https://fnet.bmfbovespa.com.br/fnet/publico"
 
+# The timezone the source publishes in. `dataEntrega` arrives on the wire with
+# no offset, so this is what "today" means for the archive: directory names, the
+# retention frontier, the query window, the _inbox filename and the watermark
+# all derive from it. It is never read from the host, so a container in UTC
+# produces byte-identical output to a laptop in Sao Paulo.
+#
+# The default is correct for Fundos.NET and there is no reason to change it in
+# normal use. It is exposed for the two cases where a fixed constant would be an
+# obstacle: reproducing a run against a different source, and testing. Note that
+# changing it on an existing archive re-dates everything downloaded afterwards
+# while leaving what is already on disk under the old dates, so treat it as a
+# deployment-wide constant, not a knob. Any IANA name available on the host is
+# accepted; an unrecognised one refuses to start rather than falling back.
+timezone = "America/Sao_Paulo"
+
 # Identifiable, as courtesy to a public endpoint we do not own.
 user_agent = "fii-docs-watcher/0.1 (+https://github.com/marcowb/fii-docs-watcher)"
 
@@ -74,7 +89,8 @@ frequency = "daily"
 # lost: widening this list later picks them up on the next run, without needing
 # to rediscover them. Pipeline B is unaffected either way -- it downloads its
 # own XMLs.
-formats = ["pdf", "xml"]
+# formats = ["pdf", "xml"]
+formats = ["pdf"]
 
 # Remove orphaned .part files older than this during startup reconciliation.
 stale_part_hours = 6

@@ -815,13 +815,14 @@ def cmd_status(config: Config, _args: argparse.Namespace) -> int:
 
 def cmd_doctor(config: Config, _args: argparse.Namespace) -> int:
     """Check everything a first run depends on, before it matters."""
-    from .clock import SOURCE_TZ, now
+    from .clock import DEFAULT_TIMEZONE, now, source_tz
     from .run import prepare_roots
 
     problems: list[str] = []
     print(f"fii-docs-watcher {__version__}")
     print(f"config:          {describe_source(config)}")
-    print(f"timezone:        {SOURCE_TZ} (fixed; independent of the host)")
+    origin = "default" if config.source.timezone == DEFAULT_TIMEZONE else "configured"
+    print(f"timezone:        {source_tz()} ({origin}; independent of the host)")
     print(f"local now:       {now().isoformat(timespec='seconds')}")
     print(f"today:           {to_dir_name(today())}")
     print(f"data root:       {config.paths.data_root}")

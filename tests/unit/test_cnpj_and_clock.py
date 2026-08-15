@@ -7,14 +7,16 @@ from datetime import date, datetime
 import pytest
 
 from fii_docs_watcher.clock import (
-    SOURCE_TZ,
+    DEFAULT_TIMEZONE,
     parse_delivery,
     parse_dir_name,
     parse_reference,
     retention_window,
+    set_timezone,
+    source_tz,
     to_dir_name,
 )
-from fii_docs_watcher.errors import SourceContractError
+from fii_docs_watcher.errors import ConfigError, SourceContractError
 from fii_docs_watcher.scope import cnpj as cnpj_mod
 
 
@@ -63,8 +65,8 @@ class TestClock:
 
     def test_delivery_is_stamped_with_the_source_timezone_not_the_host(self) -> None:
         parsed = parse_delivery("13/08/2026 19:34")
-        assert parsed == datetime(2026, 8, 13, 19, 34, tzinfo=SOURCE_TZ)
-        assert parsed.tzinfo is SOURCE_TZ
+        assert parsed == datetime(2026, 8, 13, 19, 34, tzinfo=source_tz())
+        assert parsed.tzinfo is source_tz()
 
     def test_delivery_without_a_time_still_parses(self) -> None:
         assert parse_delivery("13/08/2026").date() == date(2026, 8, 13)
@@ -124,3 +126,30 @@ class TestRetentionWindow:
     def test_zero_or_negative_retention_is_rejected(self) -> None:
         with pytest.raises(ValueError, match="must be >= 1"):
             retention_window(0)
+
+
+class TestConfigurableTimezone:
+    """The zone is settable, but it is installed once and read through a call."""
+
+    @pytest.fixture(autouse=True)
+    def restore_default(self):
+        # The zone is process-wide state, so a test that changes it has to put
+        # it back or every later test dates its fixtures differently.
+        yield
+        set_timezone(DEFAULT_TIMEZONE)
+
+    def test_the_default_is_the_source_timezone(self) -> None:
+        assert DEFAULT_TIMEZONE == "America/Sao_Paulo"
+        assert str(source_tz()) == DEFAULT_TIMEZONE
+
+    def test_setting_it_changes_how_delivery_is_stamped(self) -> None:
+        set_timezone("UTC")
+        assert str(source_tz()) == "UTC"
+        parsed = parse_delivery("13/08/2026 19:34")
+        assert parsed.utcoffset().total_seconds() == 0
+
+    def test_an_unknown_zone_refuses_to_start_rather_than_falling_back(self) -> None:
+        # Filing an archive under the wrong dates is worse than not starting.
+        with pytest.raises(ConfigError, match="not an IANA timezone"):
+            set_timezone("America/Atlantis")
+        assert str(source_tz()) == DEFAULT_TIMEZONE

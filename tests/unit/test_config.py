@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from fii_docs_watcher.clock import DEFAULT_TIMEZONE, set_timezone, source_tz
 from fii_docs_watcher.config import (
     CONFIG_SEARCH_PATH,
     ENV_CONFIG_PATH,
@@ -181,3 +182,32 @@ class TestValidation:
         config = load()
         assert config.retention.days == 21
         assert config.paths.data_root == Path("/tmp/elsewhere")
+
+
+class TestTimezone:
+    @pytest.fixture(autouse=True)
+    def restore_default(self):
+        # `load()` installs the zone process-wide, so a test that loads a
+        # non-default one would otherwise re-date every later test's fixtures.
+        yield
+        set_timezone(DEFAULT_TIMEZONE)
+
+    def test_the_default_needs_no_config_file(self) -> None:
+        assert load().source.timezone == DEFAULT_TIMEZONE
+        assert str(source_tz()) == DEFAULT_TIMEZONE
+
+    def test_loading_installs_the_configured_zone(self, isolated: Path) -> None:
+        (isolated / "config.toml").write_text('[source]\ntimezone = "UTC"\n')
+        assert load().source.timezone == "UTC"
+        # The point of the key: the clock has to actually follow it.
+        assert str(source_tz()) == "UTC"
+
+    def test_the_environment_can_override_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("FII_WATCHER_SOURCE_TIMEZONE", "Europe/Lisbon")
+        assert load().source.timezone == "Europe/Lisbon"
+        assert str(source_tz()) == "Europe/Lisbon"
+
+    def test_an_unknown_zone_is_a_config_error(self, isolated: Path) -> None:
+        (isolated / "config.toml").write_text('[source]\ntimezone = "Mars/Olympus"\n')
+        with pytest.raises(ConfigError, match="not an IANA timezone"):
+            load()

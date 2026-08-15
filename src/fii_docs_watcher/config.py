@@ -23,6 +23,7 @@ from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any
 
+from .clock import DEFAULT_TIMEZONE, set_timezone
 from .errors import ConfigError
 
 log = logging.getLogger(__name__)
@@ -99,6 +100,10 @@ class RetentionConfig:
 class SourceConfig:
     base_url: str = "https://fnet.bmfbovespa.com.br/fnet/publico"
     user_agent: str = "fii-docs-watcher/0.1 (+https://github.com/marcowb/fii-docs-watcher)"
+    # The timezone the source publishes in, never the host's. It belongs to
+    # [source] rather than to a settings-of-taste section because that is what
+    # it is: changing it re-dates the whole archive. See config.example.toml.
+    timezone: str = DEFAULT_TIMEZONE
     # Responses arrive either in ~0.3s or in ~60.3s. A 30s timeout would fail
     # about half of all requests; see config.example.toml.
     read_timeout_seconds: float = 120.0
@@ -300,6 +305,10 @@ def load(path: Path | str | None = None) -> Config:
 
     config = Config(**sections, source_path=config_path)
     _validate(config)
+    # Installed here, and only here, so that no entry point can compute a date
+    # under the default while the configuration names a different zone. It is
+    # process-wide by nature: the archive's directory names depend on it.
+    set_timezone(config.source.timezone)
     # Announcing a defaults-only load is left to the caller, which configures
     # logging immediately after this returns; emitting it here would go out
     # through the last-resort handler, unformatted and unfiltered.

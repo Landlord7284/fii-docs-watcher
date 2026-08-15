@@ -34,7 +34,7 @@ from pathlib import Path
 
 import httpx
 
-from ..clock import SOURCE_TZ, timestamp
+from ..clock import source_tz, timestamp
 from ..config import CvmConfig
 from ..errors import TransientSourceError
 from ..scope.cnpj import normalize
@@ -331,8 +331,8 @@ class RegistryCache:
         except ValueError:
             return False
         if fetched.tzinfo is None:
-            fetched = fetched.replace(tzinfo=SOURCE_TZ)
-        age = datetime.now(SOURCE_TZ) - fetched
+            fetched = fetched.replace(tzinfo=source_tz())
+        age = datetime.now(source_tz()) - fetched
         return age < timedelta(hours=self.config.refresh_interval_hours)
 
     def _download(self, user_agent: str) -> bytes:

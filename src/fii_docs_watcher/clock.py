@@ -1,4 +1,4 @@
-"""Time, fixed to America/Sao_Paulo.
+"""Time, anchored to the source's timezone (America/Sao_Paulo by default).
 
 `dataEntrega` arrives without a timezone, so "today" has to mean today in the
 source's timezone regardless of where this process happens to run. That single
@@ -6,8 +6,12 @@ choice governs the archive's directory names, the retention frontier, the query
 window, the _inbox filename and the watermark. A container running in UTC must
 produce byte-identical output to a laptop in São Paulo.
 
-Nothing here reads the host timezone, and nothing here is user-configurable:
-this is a property of the data source, not a preference.
+Nothing here ever reads the host timezone. The zone is settable -- see
+`[source].timezone`, and the deviation note in config.example.toml -- but it is
+set exactly once, at startup, from configuration; it is not a per-call argument.
+Two runs of the same archive under different zones would file the same document
+under different dates, so this is a deployment-wide constant that happens to
+have a default rather than a preference to be tuned.
 """
 
 from __future__ import annotations
@@ -17,9 +21,39 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from .errors import SourceContractError
+from .errors import ConfigError, SourceContractError
 
-SOURCE_TZ = ZoneInfo("America/Sao_Paulo")
+# The source is a Brazilian exchange filing system; every other value is a
+# deliberate override. `config.SourceConfig.timezone` defaults to this name.
+DEFAULT_TIMEZONE = "America/Sao_Paulo"
+
+# Process-wide, resolved once by `set_timezone()`. Read through `source_tz()`
+# and never imported by value: `from .clock import SOURCE_TZ` would bind the
+# default at import time and quietly ignore the configured zone.
+_tz = ZoneInfo(DEFAULT_TIMEZONE)
+
+
+def source_tz() -> ZoneInfo:
+    """The active source timezone. Always call it; never cache the result."""
+    return _tz
+
+
+def set_timezone(name: str) -> ZoneInfo:
+    """Install the source timezone for this process, from configuration.
+
+    Called once at startup, before anything computes a date. An unknown zone is
+    a configuration error rather than a fallback to the default: filing an
+    archive under the wrong dates is worse than refusing to start.
+    """
+    global _tz
+    try:
+        _tz = ZoneInfo(name)
+    except (KeyError, ValueError, OSError) as exc:
+        raise ConfigError(
+            f"[source].timezone is {name!r}, which is not an IANA timezone name "
+            f"available on this system (expected something like {DEFAULT_TIMEZONE!r})"
+        ) from exc
+    return _tz
 
 # How the source formats dates on the wire, and how we format them on disk.
 WIRE_DATETIME = "%d/%m/%Y %H:%M"
@@ -37,7 +71,7 @@ REF_FORMAT_DATETIME = "4"  # dd/MM/yyyy HH:mm
 
 def now() -> datetime:
     """Current instant in the source's timezone."""
-    return datetime.now(SOURCE_TZ)
+    return datetime.now(_tz)
 
 
 def today() -> date:
@@ -93,7 +127,7 @@ def parse_delivery(raw: str) -> datetime:
     text = (raw or "").strip()
     for fmt in (WIRE_DATETIME, WIRE_DATE):
         try:
-            return datetime.strptime(text, fmt).replace(tzinfo=SOURCE_TZ)
+            return datetime.strptime(text, fmt).replace(tzinfo=_tz)
         except ValueError:
             continue
     raise SourceContractError(

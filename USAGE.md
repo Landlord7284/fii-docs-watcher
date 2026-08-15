@@ -23,7 +23,7 @@ This document uses the short form.
 ```bash
 cp config.example.toml config.toml       # set data_root and documents_root
 fii-docs-watcher doctor                  # check the environment
-fii-docs-watcher add --name "kinea renda"
+fii-docs-watcher add --name "fund name"
 fii-docs-watcher run
 ```
 
@@ -125,8 +125,8 @@ it again.
 Registers a fund. Give it a CNPJ, or a partial name to search for.
 
 ```bash
-fii-docs-watcher add --cnpj 08.431.747/0001-06 --ticker HGBS11
-fii-docs-watcher add --name "kinea renda"        # lists matches, you pick
+fii-docs-watcher add --cnpj 12.345.678/0001-90 --ticker ABCD11
+fii-docs-watcher add --name "fund name"        # lists matches, you pick
 ```
 
 You give **one** CNPJ; the robot works out the rest. Since RCVM 175 a fund's documents may be filed
@@ -138,7 +138,7 @@ Fundos.NET can search by name but never returns a CNPJ. After you pick, it offer
 
 | Flag | Effect |
 |---|---|
-| `--ticker HGBS11` | Your annotation, used as the filename prefix. The robot never invents or validates it. |
+| `--ticker ABCD11` | Your annotation, used as the filename prefix. The robot never invents or validates it. |
 | `--this-entity-only` | Monitor only this entity, not the fund's other classes. |
 | `--no-resolve` | Write the entry without contacting the sources; the next `run` resolves it. |
 
@@ -151,8 +151,8 @@ Shows registered funds and their resolved entities. With a `QUERY`, only matchin
 
 ```bash
 fii-docs-watcher list
-fii-docs-watcher list kinea
-fii-docs-watcher list 08431747
+fii-docs-watcher list fund-name
+fii-docs-watcher list 08756747
 ```
 
 The search covers ticker, legal name, Fundos.NET description and CNPJ digits, ignoring accents,
@@ -163,9 +163,9 @@ case and punctuation.
 Stops following a fund and removes it from the watch list.
 
 ```bash
-fii-docs-watcher rm kinea                             # pick, then confirm
-fii-docs-watcher rm 12005956 --yes                    # no prompt
-fii-docs-watcher rm kinea --yes --delete-documents    # also delete its files
+fii-docs-watcher rm fund-name                             # pick, then confirm
+fii-docs-watcher rm 12982956 --yes                        # no prompt
+fii-docs-watcher rm fund-name --yes --delete-documents    # also delete its files
 ```
 
 `QUERY` searches the same way `list` does. If it matches several funds you are shown a numbered
@@ -213,9 +213,9 @@ the next run that resolves the fund, so an outage never costs you a backlog.
 Sets or clears the ticker on a fund you already registered.
 
 ```bash
-fii-docs-watcher ticker kinea                 # pick from matches, then prompt
-fii-docs-watcher ticker kinea --set KNRI11    # non-interactive
-fii-docs-watcher ticker kinea --clear
+fii-docs-watcher ticker fund.name                 # pick from matches, then prompt
+fii-docs-watcher ticker fund.name --set ABCD11    # non-interactive
+fii-docs-watcher ticker fund.name --clear
 ```
 
 If `QUERY` matches several funds you are shown a numbered list. Without a terminal, `--set` or
@@ -273,9 +273,9 @@ documents_root/
   _inbox/
     2026-08-14.md                     what arrived today, with links
   2026-08-13/
-    HGBS11_Informes-Periodicos_1290363_V01.xml
+    ABCD11_Informes-Periodicos_1450363_V01.xml
   2026-08-14/
-    KNRI11_Informes-Periodicos_1291424_V01.xml
+    ABCD11_Informes-Periodicos_1293424_V01.xml
   .tmp/                               downloads in flight
 ```
 

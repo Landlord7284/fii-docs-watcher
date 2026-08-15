@@ -38,7 +38,7 @@ base_url = "https://fnet.bmfbovespa.com.br/fnet/publico"
 timezone = "America/Sao_Paulo"
 
 # Identifiable, as courtesy to a public endpoint we do not own.
-user_agent = "fii-docs-watcher/0.1 (+https://github.com/marcowb/fii-docs-watcher)"
+user_agent = "fii-docs-watcher/0.1 (+https://github.com/Landlord7284/fii-docs-watcher)"
 
 # Successful responses from this host are bimodally distributed: they return in
 # ~0.3s or in ~60.3s, with nothing in between. A conventional 30s timeout fails

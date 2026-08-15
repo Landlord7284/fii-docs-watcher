@@ -1,0 +1,21 @@
+# config.toml first, and for a reason: it is gitignored but present in a
+# working checkout, and copying it into the image would bake one developer's
+# paths into everyone's container.
+config.toml
+.env
+
+.git
+.gitignore
+.github
+.venv
+var
+*.egg-info
+__pycache__
+.pytest_cache
+.ruff_cache
+tests
+Dockerfile
+.dockerignore
+compose.yaml
+*.md
+!README.md

@@ -99,7 +99,7 @@ class RetentionConfig:
 @dataclass(frozen=True)
 class SourceConfig:
     base_url: str = "https://fnet.bmfbovespa.com.br/fnet/publico"
-    user_agent: str = "fii-docs-watcher/0.1 (+https://github.com/marcowb/fii-docs-watcher)"
+    user_agent: str = "fii-docs-watcher/0.1 (+https://github.com/Landlord7284/fii-docs-watcher)"
     # The timezone the source publishes in, never the host's. It belongs to
     # [source] rather than to a settings-of-taste section because that is what
     # it is: changing it re-dates the whole archive. See config.example.toml.

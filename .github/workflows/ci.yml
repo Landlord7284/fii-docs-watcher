@@ -1,0 +1,35 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Called by the image build, so an image is never published from a red tree.
+  workflow_call:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor declared in pyproject, and the version the image runs.
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install
+        run: pip install -e ".[dev]"
+
+      - name: Lint
+        run: ruff check src tests docker
+
+      # The default suite is hermetic -- it answers Fundos.NET and the CVM
+      # registry from an in-process fake. The `live` marker, which hits the
+      # real sources, stays deselected by pyproject's addopts.
+      - name: Test
+        run: pytest

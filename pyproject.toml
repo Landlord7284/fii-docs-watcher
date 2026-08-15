@@ -10,6 +10,11 @@ requires-python = ">=3.12"
 dependencies = [
     "httpx>=0.27",
     "ruamel.yaml>=0.18",
+    # `clock` resolves a zone at import time, so an absent IANA database is a
+    # crash before any error handling runs. `zoneinfo` prefers the system
+    # database and falls back to this wheel, which makes the package work on a
+    # minimal Linux image that ships none.
+    "tzdata>=2024.1",
 ]
 
 [project.scripts]
@@ -24,6 +29,14 @@ dev = [
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# `manifest/db.py` reads schema.sql at runtime, so it has to be in the wheel.
+# Current setuptools includes it anyway, since include-package-data defaults to
+# true for a pyproject-configured project -- this states the requirement rather
+# than relying on that default, because the failure it would cause is a
+# FileNotFoundError on first connect, only ever seen in a built install.
+[tool.setuptools.package-data]
+fii_docs_watcher = ["**/*.sql"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
@@ -33,7 +46,9 @@ addopts = "-m 'not live'"
 
 [tool.ruff]
 line-length = 100
-src = ["src", "tests"]
+# `docker` holds the container's scheduling driver, which imports the package
+# and is linted with it even though it is packaging rather than part of it.
+src = ["src", "tests", "docker"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]

@@ -1,7 +1,10 @@
 var/
 .venv/
 config.toml
+.env
+documents/
 __pycache__/
 *.egg-info/
 .pytest_cache/
 .ruff_cache/
+build/

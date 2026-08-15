@@ -7,6 +7,13 @@ the standard streams and the file is purely additive.
 
 Records are split by severity: WARNING and below go to stdout, ERROR and above
 to stderr, so a wrapper script can treat stderr as the thing worth paging on.
+
+Timestamps are stamped in the source's timezone, not the host's. `formatTime`
+would otherwise use libc `localtime`, which is the one place the host timezone
+could leak into this program: a container left in UTC would log an event at
+one date while filing it under another, for the same event. Anchoring the logs
+to `clock.source_tz()` keeps `[source].timezone` the single answer to what time
+it is here.
 """
 
 from __future__ import annotations
@@ -14,11 +21,16 @@ from __future__ import annotations
 import json
 import logging
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .clock import source_tz
+
 if TYPE_CHECKING:
     from .config import LoggingConfig
+
+_TIMESTAMP = "%Y-%m-%dT%H:%M:%S%z"
 
 # Attributes present on every LogRecord; anything else was attached by us via
 # `extra=` and belongs in the structured output.
@@ -27,10 +39,21 @@ _STANDARD_ATTRS = frozenset(
 ) | {"asctime", "message", "taskName"}
 
 
-class _JsonFormatter(logging.Formatter):
+class _SourceTimeFormatter(logging.Formatter):
+    """Base class stamping records in the source's timezone."""
+
+    def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:
+        # camelCase because this overrides logging's own hook.
+        # Resolved per call, never bound at import: the zone is installed from
+        # configuration at startup, after this module is imported.
+        moment = datetime.fromtimestamp(record.created, tz=source_tz())
+        return moment.strftime(datefmt or _TIMESTAMP)
+
+
+class _JsonFormatter(_SourceTimeFormatter):
     def format(self, record: logging.LogRecord) -> str:
         payload: dict[str, object] = {
-            "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
+            "ts": self.formatTime(record, _TIMESTAMP),
             "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),
@@ -43,13 +66,13 @@ class _JsonFormatter(logging.Formatter):
         return json.dumps(payload, ensure_ascii=False, default=str)
 
 
-class _TextFormatter(logging.Formatter):
+class _TextFormatter(_SourceTimeFormatter):
     """Human-readable, with any structured context appended as key=value pairs."""
 
     def __init__(self) -> None:
         super().__init__(
             fmt="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
-            datefmt="%Y-%m-%dT%H:%M:%S%z",
+            datefmt=_TIMESTAMP,
         )
 
     def format(self, record: logging.LogRecord) -> str:

@@ -13,7 +13,7 @@ python -m venv .venv
 .venv/bin/pip install -e .
 ```
 
-Python 3.12 or newer. Two dependencies: `httpx` and `ruamel.yaml`.
+Python 3.12 or newer. Three dependencies: `httpx`, `ruamel.yaml` and `tzdata`.
 
 Either run it as `python -m fii_docs_watcher …` or, with the venv active, as `fii-docs-watcher …`.
 This document uses the short form.
@@ -36,6 +36,50 @@ takes no arguments and exits with a meaningful code.
 ```cron
 30 8 * * *  cd /srv/fii && /srv/fii/.venv/bin/fii-docs-watcher run >> /var/log/fii.log 2>&1
 ```
+
+### With Docker
+
+```bash
+cp config.example.toml config.toml
+cp .env.example .env
+docker compose up -d
+```
+
+The container schedules the same one-shot `run` for you, so there is no cron line. Everything else
+is one invocation at a time:
+
+```bash
+docker compose run --rm watcher doctor
+docker compose run --rm watcher status
+docker compose run --rm watcher add --name "fund name"   # interactive; a TTY is attached
+```
+
+`config.toml` is mounted and configures the robot exactly as it does outside a container. `.env`
+holds only what has no place in it:
+
+| Variable | What it does |
+|---|---|
+| `IMAGE_TAG` | Which published image to run. Pin a version to make updates deliberate. |
+| `DOCUMENTS_PATH` | Where the archive lands on the host. This is the directory you share. |
+| `PUID` / `PGID` | The uid and gid that own what the robot writes. |
+| `RUN_SCHEDULE` | When to run: a 5-field cron expression, default `0 8/6 * * *` (08:00, 14:00, 20:00). |
+| `RUN_ON_START` | Run once at startup rather than waiting for the first scheduled time. |
+
+`RUN_SCHEDULE` is read in the source's timezone, the same one directory names use, so a time here
+means what a directory name means. It takes five fields, not the six-field form whose first field
+is seconds.
+
+Two constraints the compose file already satisfies, worth knowing before you change it:
+
+- **`data_root` is a named volume, not a bind mount to a share.** SQLite in WAL mode and the run
+  lock both need a local filesystem.
+- **`documents_root` must be a single mount.** Downloads are staged in `.tmp/` inside it so the
+  final rename is atomic; mounting `.tmp/` or a date directory separately puts them on a different
+  filesystem and the robot refuses to start.
+
+Inside the container `data_root` and `documents_root` are fixed at `/data` and `/documents` by the
+image, so those two keys in your `config.toml` have no effect there — the host side of the mapping
+is `DOCUMENTS_PATH`.
 
 ---
 
@@ -320,8 +364,10 @@ can tell a slow run from a stuck one. Use `--verbose` for per-request detail.
 current directory. Either `cd` to where your `config.toml` lives, or pass `--config`, or set
 `$FII_WATCHER_CONFIG`.
 
-**Exit code 3 / "another instance is running"** — a previous run is still going, or was killed hard.
-A lock left by a dead process is detected and reclaimed automatically on the next run.
+**Exit code 3 / "another instance is running"** — a previous run is still going. A run that was
+killed hard does not leave a lock behind: the lock is held by the kernel for as long as the process
+lives, so it is gone the moment the process is. `watcher.lock` stays in `data_root` as an empty
+file between runs; that is not a held lock and there is never a reason to delete it by hand.
 
 **A scope stays `UNRESOLVED`** — run `fii-docs-watcher resolve` and read the log. Common causes: the
 CNPJ is not a registered FII in the CVM registry, or the CVM registry could not be downloaded (in

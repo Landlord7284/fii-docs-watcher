@@ -16,7 +16,7 @@ Parsing the documents is out of scope — that is a separate pipeline.
 
 ## Install
 
-Python 3.12 or newer. Two runtime dependencies (`httpx`, `ruamel.yaml`); everything else is standard
+Python 3.12 or newer. Three runtime dependencies (`httpx`, `ruamel.yaml`, `tzdata`); everything else is standard
 library.
 
 ```bash
@@ -50,6 +50,27 @@ arguments and exits `0` clean, `1` isolated failure, `2` bad configuration, `3` 
 
 Runs taking minutes is normal — the source answers in either ~0.3s or ~60s, with nothing in between.
 
+## Docker
+
+```bash
+cp config.example.toml config.toml     # the robot's settings, same file as above
+cp .env.example .env                   # where the archive lands, and when to run
+docker compose up -d
+```
+
+`config.toml` configures the robot in either mode; `.env` only parameterizes the container — the
+image tag, the host directory for the archive, the uid that owns it, and the schedule. There is no
+second set of settings to find.
+
+The container runs the same one-shot `run` on a schedule (`RUN_SCHEDULE`, a cron expression,
+default 08:00/14:00/20:00). Every other command is still one invocation:
+
+```bash
+docker compose run --rm watcher doctor
+docker compose run --rm watcher add --cnpj 12.345.678/0001-90 --ticker ABCD11
+docker compose logs -f
+```
+
 ## Documentation
 
 - **[USAGE.md](USAGE.md)** — the full command reference: every subcommand, every setting,
@@ -62,5 +83,5 @@ Runs taking minutes is normal — the source answers in either ~0.3s or ~60s, wi
 ```bash
 pytest                    # unit + contract + integration
 pytest -m live            # re-measure the real source (slow; needs network)
-ruff check src tests
+ruff check src tests docker
 ```

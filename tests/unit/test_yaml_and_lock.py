@@ -314,36 +314,70 @@ class TestTickerEditing:
 
 class TestProcessLock:
     def test_a_second_instance_is_refused_while_the_first_holds_it(self, tmp_path: Path) -> None:
+        # `flock` is held per open file description, so a second ProcessLock
+        # opens its own descriptor and is excluded exactly as another process
+        # would be.
         path = tmp_path / "watcher.lock"
         with ProcessLock(path):
             with pytest.raises(LockHeldError, match="another instance is running"):
                 ProcessLock(path).acquire()
 
+    def test_the_holder_is_named_in_the_refusal(self, tmp_path: Path) -> None:
+        # A blocked run has to be able to say who is holding the lock; that is
+        # the only reason the payload is written at all.
+        path = tmp_path / "watcher.lock"
+        with ProcessLock(path):
+            with pytest.raises(LockHeldError, match=f"pid {os.getpid()}"):
+                ProcessLock(path).acquire()
+
     def test_the_lock_is_released_on_the_way_out(self, tmp_path: Path) -> None:
+        # The file stays -- unlinking a flocked file is racy, and an unlocked
+        # lock file means nothing. What must be true is that it can be taken
+        # again.
         path = tmp_path / "watcher.lock"
         with ProcessLock(path):
             assert path.exists()
-        assert not path.exists()
+        with ProcessLock(path):
+            pass
 
     def test_it_is_released_even_when_the_run_raises(self, tmp_path: Path) -> None:
         path = tmp_path / "watcher.lock"
         with pytest.raises(RuntimeError), ProcessLock(path):
             raise RuntimeError("boom")
-        assert not path.exists()
+        with ProcessLock(path):
+            pass
 
-    def test_a_lock_left_by_a_dead_process_is_reclaimed(self, tmp_path: Path) -> None:
-        # Otherwise a crash would block the robot until a human intervened.
+    def test_a_lock_left_behind_by_a_dead_process_does_not_block(
+        self, tmp_path: Path
+    ) -> None:
+        # The whole point of flock over a pidfile: a run that died holds
+        # nothing, whatever its file still says. The recorded PID here is one
+        # that exists -- our own -- which is precisely the case a liveness
+        # probe would get wrong.
         path = tmp_path / "watcher.lock"
-        path.write_text(json.dumps({"pid": 999_999, "acquired_at": "x"}), encoding="utf-8")
+        path.write_text(
+            json.dumps({"pid": os.getpid(), "acquired_at": "x", "host": "gone"}),
+            encoding="utf-8",
+        )
 
         with ProcessLock(path):
             owner = json.loads(path.read_text(encoding="utf-8"))
             assert owner["pid"] == os.getpid()
+            assert owner["host"] == os.uname().nodename
 
-    def test_a_corrupt_lock_file_is_reclaimed_rather_than_blocking_forever(
+    def test_a_corrupt_lock_file_does_not_block_and_is_overwritten(
         self, tmp_path: Path
     ) -> None:
         path = tmp_path / "watcher.lock"
         path.write_text("not json at all", encoding="utf-8")
+        with ProcessLock(path):
+            assert json.loads(path.read_text(encoding="utf-8"))["pid"] == os.getpid()
+
+    def test_the_payload_never_carries_a_previous_runs_leftovers(
+        self, tmp_path: Path
+    ) -> None:
+        # A longer stale payload must be truncated, not partially overwritten.
+        path = tmp_path / "watcher.lock"
+        path.write_text("x" * 4096, encoding="utf-8")
         with ProcessLock(path):
             assert json.loads(path.read_text(encoding="utf-8"))["pid"] == os.getpid()

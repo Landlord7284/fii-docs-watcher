@@ -6,14 +6,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `arquitetura-fii-monitor-pipeline-a-rev3.md` is the architecture and boundary-conditions document (revision 3) for **Pipeline A** — a robot that downloads Brazilian real-estate fund (FII) documents daily from Fundos.NET and files them into per-day directories for human reading, over a sliding N-day retention window.
 
-Pipeline A is implemented in Python 3.12+ under `src/fii_docs_watcher/`, with two dependencies: `httpx` and `ruamel.yaml` (the latter because §3.6 requires comments to survive a rewrite, which PyYAML cannot do). Everything else is standard library.
+Pipeline A is implemented in Python 3.12+ under `src/fii_docs_watcher/`, with three dependencies: `httpx`, `ruamel.yaml` (because §3.6 requires comments to survive a rewrite, which PyYAML cannot do) and `tzdata` (because `clock` resolves a zone at import time and a minimal Linux image ships no IANA database, making it a crash before any error handling runs). Everything else is standard library.
 
 ```bash
 python -m venv .venv && .venv/bin/pip install -e ".[dev]"
 
 .venv/bin/pytest                 # unit + contract + integration; live tests deselected
 .venv/bin/pytest -m live         # re-measure the real source (slow; needs network)
-.venv/bin/ruff check src tests   # lint
+.venv/bin/ruff check src tests docker   # lint
 ```
 
 Running it, once a `config.toml` exists (copy `config.example.toml`):
@@ -27,6 +27,16 @@ python -m fii_docs_watcher run       # the canonical one-shot mode
 **`USAGE.md` at the repo root is the user-facing command reference** — keep it in step with the CLI.
 
 Other subcommands: `list [QUERY]`, `rm QUERY`, `ticker QUERY`, `resolve`, `reconcile`, `purge`, `audit`, `status`. Exit codes: `0` clean, `1` ran with isolated failures, `2` bad configuration, `3` another instance holds the lock.
+
+## Container packaging
+
+`Dockerfile`, `compose.yaml`, `.env.example` and `docker/` package the robot as an image published to GHCR by `.github/workflows/docker-publish.yml`. Nothing in the package knows about any of it — §7's portability rule holds, and the image is one way to run the same one-shot CLI.
+
+**`config.toml` is the application's configuration in both modes**, mounted at `/config/config.toml` in the container and native on a host. `.env` carries only what has no TOML counterpart: `IMAGE_TAG`, `DOCUMENTS_PATH`, `PUID`/`PGID`, `RUN_SCHEDULE`, `RUN_ON_START`. Do not grow `.env.example` into a second copy of the settings — a config file plus targeted `FII_WATCHER_*` overrides is the arrangement; two parallel documented surfaces is not, and one of them would inevitably drift.
+
+The image pins `FII_WATCHER_PATHS_DATA_ROOT=/data` and `FII_WATCHER_PATHS_DOCUMENTS_ROOT=/documents`, so those two keys in a mounted config are inert. That is deliberate: the container paths follow from the volume layout, and a user who copied the example without repointing `./var/…` would otherwise write the archive into the container's ephemeral layer and lose it on the next recreate.
+
+`docker/scheduler.py` is the periodic driver and lives **outside** the package, because §7 requires a daemon mode to be built on top of one-shot rather than the other way round. It spawns `python -m fii_docs_watcher run` as a child process — so a crash inside a run cannot kill the loop — and matches its 5-field cron expression by waking each minute and testing the current time in `clock.source_tz()`. Schedules therefore mean the same thing as directory names. It is tested by `tests/unit/test_scheduler.py`, which loads it by path.
 
 **A fund can leave the watch list two ways, and both must stop its backlog.** `discover` stops querying a fund once it leaves `funds.yaml`, but `fetch` builds its queue from the manifest, not from the scope list. Three mechanisms keep that honest:
 
@@ -91,9 +101,10 @@ Section pointers refer to `arquitetura-fii-monitor-pipeline-a-rev3.md`.
 - **Two separate roots.** `data_root` is private (funds YAML, SQLite manifest, lock, CVM cache) and must live on a filesystem local to the process — SQLite over SMB/NFS has unreliable locking and durability. `documents_root` is the shareable archive. Download temporaries (`.part`) go under `documents_root/.tmp/` so `rename` stays atomic within one filesystem (§5.1).
 - **Date directories are `yyyy-mm-dd`, zero-padded, keyed on `dataEntrega`** — not on download date. Lexicographic order must equal chronological order; purge and human reading depend on it (§5.2).
 - **`N` is the number of dates retained, including today**: `first_retained_date = today - (N-1)`. Purge, query window, and the `_inbox` index use that one frontier, or discovery downloads what purge then deletes (§5.6).
+- **The run lock is `flock`, not a pidfile.** The kernel releases it when the holder dies, so there is no stale lock to detect and a crash can never strand the robot. A pidfile cannot be honest about this: PIDs are namespace-local and reused, so a lock recorded by a dead process can name a PID that is alive again — near-certain in a container, where the run is often PID 1 — and the liveness probe then blocks every subsequent run with exit 3 forever. The JSON payload inside `watcher.lock` is diagnostic only; nothing reads it to make a decision, and the file is left in place on release because unlinking a flocked file is racy. This relies on `data_root` being local, which §5.1 already requires.
 - **Download state machine** `discovered → downloading → available`, with reconciliation of intermediate states at startup. Filesystem and SQLite do not form one atomic transaction, so idempotency rests on the manifest plus reconciliation — never on file existence alone (§5.5).
 - **YAML write protection.** Atomic temp file + `rename`, *and* compare the hash of the on-disk content against what was loaded before renaming; if it changed, do not overwrite — record a visible conflict and keep the human's edit. `mtime` is insufficient. Comments must survive the rewrite. CNPJ is a string through the whole cycle, or a YAML parser eats the leading zero (§3.6).
-- **Timezone is anchored to the source, never to the host or container**, for "today", directory dates, retention frontier, index, and watermark. **Stated deviation from §5.8:** the spec calls this fixed and not a user setting; it is exposed as `[source].timezone`, defaulting to `America/Sao_Paulo`, so that a run can be reproduced against a differently-zoned source and so tests can vary it. The invariant that survives is the one that matters — the zone is *never* read from the host, is installed exactly once by `config.load()` via `clock.set_timezone()`, and an unrecognised name refuses to start rather than falling back. Read it with `clock.source_tz()`; never `from .clock import` the zone by value, which would bind the default at import time and silently ignore the configuration.
+- **Timezone is anchored to the source, never to the host or container**, for "today", directory dates, retention frontier, index, watermark, and **log timestamps** — `logging_setup` overrides `formatTime` for exactly this reason, since `logging`'s default uses libc `localtime` and would otherwise stamp an event with one date while the same event is filed under another. **Stated deviation from §5.8:** the spec calls this fixed and not a user setting; it is exposed as `[source].timezone`, defaulting to `America/Sao_Paulo`, so that a run can be reproduced against a differently-zoned source and so tests can vary it. The invariant that survives is the one that matters — the zone is *never* read from the host, is installed exactly once by `config.load()` via `clock.set_timezone()`, and an unrecognised name refuses to start rather than falling back. Read it with `clock.source_tz()`; never `from .clock import` the zone by value, which would bind the default at import time and silently ignore the configuration.
 - **Portability.** Nothing may depend on Docker, TrueNAS, systemd, cron, or any orchestrator. Running once from a shell with a config file must work; a daemon mode, if any, is built on top of one-shot. No hardcoded paths, CNPJs, or personal preferences. Logs to stdout/stderr by default. No credentials — the source is public and unauthenticated (§7).
 - **Isolated failure never kills the batch.** A bad scope, entity, or document is recorded and skipped; the rest proceed. Severity ladder: `WARNING` transient/retryable, `ERROR` needs human action, `CRITICAL` the source contract likely changed or a CNPJ validation diverged (§8).
 - **Pipeline A and Pipeline B share only the downloader.** B never reads files written by A, and A's purge never depends on B's progress. If B needs an XML, it downloads its own (§1).

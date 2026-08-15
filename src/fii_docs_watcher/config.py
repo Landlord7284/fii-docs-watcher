@@ -99,7 +99,7 @@ class RetentionConfig:
 @dataclass(frozen=True)
 class SourceConfig:
     base_url: str = "https://fnet.bmfbovespa.com.br/fnet/publico"
-    user_agent: str = "fii-docs-watcher/0.1 (+https://github.com/Landlord7284/fii-docs-watcher)"
+    user_agent: str = "fii-docs-watcher/0.2 (+https://github.com/Landlord7284/fii-docs-watcher)"
     # The timezone the source publishes in, never the host's. It belongs to
     # [source] rather than to a settings-of-taste section because that is what
     # it is: changing it re-dates the whole archive. See config.example.toml.
@@ -132,11 +132,13 @@ class AuditConfig:
 class DownloadConfig:
     stale_part_hours: int = 6
 
-    # Which content formats are worth keeping. Both by default, so the archive
-    # holds everything the funds publish; naming one makes the robot decline the
-    # other. The decision is made before the request wherever the listing allows
-    # it to be predicted, so an unwanted format costs no bandwidth at all.
-    formats: tuple[str, ...] = ("pdf", "xml")
+    # Which content formats are worth keeping. PDF only by default: this is a
+    # reading queue for people, and the XML is a machine-readable duplicate of
+    # the same filing that Pipeline B fetches for itself. Adding "xml" here
+    # archives both. The decision is made before the request wherever the
+    # listing allows the format to be predicted, so a declined format usually
+    # costs no bandwidth at all.
+    formats: tuple[str, ...] = ("pdf",)
 
     def wants(self, extension: str) -> bool:
         return extension.lower().lstrip(".") in self.formats

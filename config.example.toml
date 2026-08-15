@@ -38,7 +38,7 @@ base_url = "https://fnet.bmfbovespa.com.br/fnet/publico"
 timezone = "America/Sao_Paulo"
 
 # Identifiable, as courtesy to a public endpoint we do not own.
-user_agent = "fii-docs-watcher/0.1 (+https://github.com/Landlord7284/fii-docs-watcher)"
+user_agent = "fii-docs-watcher/0.2 (+https://github.com/Landlord7284/fii-docs-watcher)"
 
 # Successful responses from this host are bimodally distributed: they return in
 # ~0.3s or in ~60.3s, with nothing in between. A conventional 30s timeout fails
@@ -77,19 +77,20 @@ frequency = "daily"
 
 [download]
 # Which content formats to keep. `downloadDocumento` serves PDF and XML from the
-# same endpoint, so both are archived by default.
+# same endpoint; only the PDF is kept by default, because this is a reading
+# queue for people and the XML is the same filing in a machine-readable shape.
+# Pipeline B downloads its own, so keeping it here buys nothing unless you want
+# it yourself. To keep both:  formats = ["pdf", "xml"]
 #
-# Naming only one makes the robot decline the other. Where the listing lets the
-# format be predicted (documents whose category or type says "Estruturado" come
-# back as XML) the decision is made *before* the request, so an unwanted format
-# costs no bandwidth at all. If the prediction turns out wrong, the downloaded
-# file is still declined and a warning is logged.
+# Where the listing lets the format be predicted (documents whose category or
+# type says "Estruturado" come back as XML) the decision is made *before* the
+# request, so a declined format costs no bandwidth at all. If the prediction
+# turns out wrong, the downloaded file is still declined and a warning is
+# logged.
 #
 # Documents declined this way are recorded in the manifest as `skipped`, not
 # lost: widening this list later picks them up on the next run, without needing
-# to rediscover them. Pipeline B is unaffected either way -- it downloads its
-# own XMLs.
-# formats = ["pdf", "xml"]
+# to rediscover them.
 formats = ["pdf"]
 
 # Remove orphaned .part files older than this during startup reconciliation.

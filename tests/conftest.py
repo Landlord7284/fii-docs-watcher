@@ -59,7 +59,11 @@ def config(tmp_path: Path) -> Config:
         ),
         cvm=CvmConfig(registry_url="https://cvm.test/registro_fundo_classe.zip"),
         audit=AuditConfig(frequency="never"),
-        download=DownloadConfig(stale_part_hours=6),
+        # Both formats, unlike the shipped default of PDF only: most of these
+        # tests are about how an XML is validated, named and filed, so the
+        # fixture has to ask for one. The tests that care about declining a
+        # format narrow this themselves.
+        download=DownloadConfig(stale_part_hours=6, formats=("pdf", "xml")),
         files=FilesConfig(),
         logging=LoggingConfig(level="DEBUG"),
     )

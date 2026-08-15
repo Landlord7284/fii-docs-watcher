@@ -50,7 +50,7 @@ The config file is **discovered** — `--config` → `$FII_WATCHER_CONFIG` → `
 
 **Do not lower `[source].read_timeout_seconds` below ~90s.** Successful responses from this host are bimodal — ~0.3s or ~60.3s, nothing between — so a conventional 30s timeout fails roughly half of all *successful* requests.
 
-**`[download].formats`** (default `["pdf", "xml"]`) selects which formats are archived. Naming one declines the other *before the request* wherever the listing allows the format to be predicted; a mispredict is declined after download with a warning. Declined documents are recorded as `skipped` rather than dropped, and `pending_downloads()` re-evaluates them every run, so widening the list picks them up without re-discovery.
+**`[download].formats`** (default `["pdf"]`) selects which formats are archived. **XML is opt-in**: the archive is a reading queue for people, and the XML is the same filing in a machine-readable shape that Pipeline B fetches for itself. Adding a format declines the others *before the request* wherever the listing allows the format to be predicted; a mispredict is declined after download with a warning. Declined documents are recorded as `skipped` rather than dropped, and `pending_downloads()` re-evaluates them every run, so widening the list picks them up without re-discovery.
 
 ## The spec is the authority
 

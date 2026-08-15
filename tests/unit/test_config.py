@@ -105,11 +105,20 @@ class TestDiscovery:
 
 
 class TestFormats:
-    def test_both_formats_by_default(self) -> None:
+    def test_pdf_only_by_default(self) -> None:
+        # A reading queue for people. The XML is the same filing in a
+        # machine-readable shape, and Pipeline B fetches its own.
         config = load()
-        assert config.download.formats == ("pdf", "xml")
-        assert config.download.all_formats
-        assert config.download.wants("pdf") and config.download.wants("xml")
+        assert config.download.formats == ("pdf",)
+        assert not config.download.all_formats
+        assert config.download.wants("pdf")
+        assert not config.download.wants("xml")
+
+    def test_xml_is_opt_in(self, isolated: Path) -> None:
+        (isolated / "config.toml").write_text('[download]\nformats = ["pdf", "xml"]\n')
+        download = load().download
+        assert download.formats == ("pdf", "xml")
+        assert download.all_formats
 
     def test_a_toml_array_is_read(self, isolated: Path) -> None:
         (isolated / "config.toml").write_text('[download]\nformats = ["xml"]\n')

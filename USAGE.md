@@ -111,7 +111,7 @@ FII_WATCHER_DOWNLOAD_FORMATS=xml fii-docs-watcher run
 | `paths.data_root` | `./var/data` | Private state: `funds.yaml`, `manifest.sqlite`, the lock, the CVM cache. **Must be on a local filesystem** — SQLite over SMB/NFS is not safe. |
 | `paths.documents_root` | `./var/documents` | The archive. This is the one you share. |
 | `retention.days` | `7` | Dates kept, **including today**. `N=7` on the 14th keeps the 8th to the 14th. |
-| `download.formats` | `["pdf", "xml"]` | Which formats to keep. See [Choosing formats](#choosing-formats). |
+| `download.formats` | `["pdf"]` | Which formats to keep. XML is opt-in. See [Choosing formats](#choosing-formats). |
 | `download.stale_part_hours` | `6` | Age at which an orphaned `.part` file is swept. |
 | `source.timezone` | `America/Sao_Paulo` | The zone the source publishes in, and therefore what "today" means for directory names, the retention frontier and the index. Never read from the host. The default is correct for Fundos.NET; changing it on an existing archive re-dates everything downloaded afterwards. |
 | `source.read_timeout_seconds` | `120` | **Do not lower below ~90.** See [Why runs are slow](#why-runs-are-slow). |
@@ -126,12 +126,15 @@ There are no credentials anywhere: the source is public and unauthenticated.
 
 ### Choosing formats
 
-`downloadDocumento` serves PDF and XML from the same endpoint. By default both are archived.
-Naming one makes the robot decline the other:
+`downloadDocumento` serves PDF and XML from the same endpoint. **By default only the PDF is
+archived**: this is a reading queue for people, and the XML is the same filing in a machine-readable
+shape — Pipeline B downloads its own, so keeping it here buys nothing unless you want it yourself.
+
+Ask for both, and the robot keeps both:
 
 ```toml
 [download]
-formats = ["pdf"]     # only PDFs; XML is not downloaded at all
+formats = ["pdf", "xml"]
 ```
 
 Where the format can be predicted from the listing — documents whose category or type says

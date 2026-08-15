@@ -18,6 +18,7 @@ import httpx
 import pytest
 
 from fii_docs_watcher.config import MAX_PAGE_LENGTH, SourceConfig
+from fii_docs_watcher.cvm.registry import servable_fund_types
 from fii_docs_watcher.errors import SourceContractError, TransientSourceError
 from fii_docs_watcher.fnet import funds as fnet_funds
 from fii_docs_watcher.fnet.client import FnetClient
@@ -205,3 +206,24 @@ class TestLiveSource:
             # relaxed -- but nothing should rely on it until it is re-verified.
             assert row.get("cnpjFundo") is None
             assert row.get("idFundo") is None
+
+    def test_every_monitorable_fund_type_still_answers(self) -> None:
+        # The categories endpoint is the cheapest proof that a fund type exists:
+        # one request, no window, no paging. A type that goes empty here means
+        # the vocabulary changed and `SERVABLE_FAMILIES` needs re-measuring.
+        with FnetClient(LIVE_CONFIG) as client:
+            for fund_type in servable_fund_types():
+                payload = client.get(
+                    "listarTodasCategoriaPorTipoFundo", {"idTipoFundo": fund_type}
+                ).json()
+                assert payload, f"fund type {fund_type} returned no document categories"
+
+    def test_an_agro_fund_is_listed_only_under_its_own_type(self) -> None:
+        # The finding the discovered-type design rests on: a name is invisible
+        # under any catalogue but its own, and the miss is silent -- an empty
+        # result rather than an error.
+        with FnetClient(LIVE_CONFIG) as client:
+            agro = fnet_funds.search(client, "POLLI FIAGRO", fund_type=11)
+            real_estate = fnet_funds.search(client, "POLLI FIAGRO", fund_type=1)
+        assert agro, "the agro catalogue no longer lists a known FIAGRO"
+        assert not real_estate

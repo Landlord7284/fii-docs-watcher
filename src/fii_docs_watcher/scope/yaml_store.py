@@ -308,6 +308,7 @@ def _scope_from_entry(entry: dict) -> Scope:
                 fundosnet_id=resolved_id,
                 fnet_fund_description=str(raw.get("fnet_fund_description") or ""),
                 kind=str(raw.get("kind") or "fund_or_class"),
+                fnet_fund_type=_opt_int(raw.get("fnet_fund_type"), default=1),
                 validated_at=_opt_str(raw.get("validated_at")),
                 cnpj_confirmed=bool(raw.get("cnpj_confirmed", False)),
             )
@@ -331,6 +332,25 @@ def _opt_str(value: object) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _opt_int(value: object, *, default: int) -> int:
+    """Read an optional integer, falling back rather than refusing the entity.
+
+    A watch list written before the field existed simply has no value, and a
+    hand-edited one may have nonsense. Neither is worth dropping an otherwise
+    resolved entity over: the fallback is the value that was implicit before.
+    """
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        log.warning(
+            "entity has a non-integer fnet_fund_type; using the default",
+            extra={"value": repr(value), "default": default},
+        )
+        return default
 
 
 def _apply_scope(entry: CommentedMap, scope: Scope) -> None:
@@ -359,6 +379,7 @@ def _apply_scope(entry: CommentedMap, scope: Scope) -> None:
         # leading zero safe through the next load.
         item["cnpj"] = Quoted(format_masked(entity.cnpj) or entity.cnpj)
         item["fundosnet_id"] = entity.fundosnet_id
+        item["fnet_fund_type"] = entity.fnet_fund_type
         item["fnet_fund_description"] = entity.fnet_fund_description
         item["validated_at"] = Quoted(entity.validated_at or to_dir_name(today()))
         item["cnpj_confirmed"] = entity.cnpj_confirmed

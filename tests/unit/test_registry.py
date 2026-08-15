@@ -2,24 +2,61 @@
 
 from __future__ import annotations
 
+import io
+import zipfile
+
 import pytest
 
 from fii_docs_watcher.cvm.registry import (
+    SERVABLE_FAMILIES,
     RegisteredClass,
     RegisteredFund,
     RegistrySnapshot,
+    class_family,
     fold_name,
+    parse_archive,
 )
 
 
-def _fund(registry_id: str, cnpj: str, name: str, situation: str = "Em Funcionamento Normal"):
+def _archive(
+    *, funds: list[tuple[str, str, str, str]], classes: list[tuple[str, str, str, str, str]]
+) -> bytes:
+    """Build a registry ZIP with the real encoding, delimiter and column names."""
+    fund_rows = ["ID_Registro_Fundo;CNPJ_Fundo;Codigo_CVM;Tipo_Fundo;Denominacao_Social;Situacao"]
+    fund_rows += [
+        f"{registry_id};{cnpj};1;{family};{name};Em Funcionamento Normal"
+        for registry_id, cnpj, name, family in funds
+    ]
+    class_rows = [
+        "ID_Registro_Classe;ID_Registro_Fundo;CNPJ_Classe;Codigo_CVM;Tipo_Classe;"
+        "Denominacao_Social;Situacao"
+    ]
+    class_rows += [
+        f"{registry_id};{fund_id};{cnpj};1;{tipo};{name};Em Funcionamento Normal"
+        for registry_id, fund_id, cnpj, name, tipo in classes
+    ]
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("registro_fundo.csv", "\r\n".join(fund_rows).encode("latin-1"))
+        archive.writestr("registro_classe.csv", "\r\n".join(class_rows).encode("latin-1"))
+    return buffer.getvalue()
+
+
+def _fund(
+    registry_id: str,
+    cnpj: str,
+    name: str,
+    situation: str = "Em Funcionamento Normal",
+    family: str = "FII",
+):
     return RegisteredFund(
         registry_id=registry_id,
         cnpj=cnpj,
         cvm_code="1",
         legal_name=name,
         situation=situation,
-        fund_type="FII",
+        family=family,
     )
 
 
@@ -29,6 +66,7 @@ def _klass(
     cnpj: str,
     name: str,
     situation: str = "Em Funcionamento Normal",
+    family: str = "FII",
 ):
     return RegisteredClass(
         registry_id=registry_id,
@@ -37,7 +75,7 @@ def _klass(
         cvm_code="1",
         legal_name=name,
         situation=situation,
-        class_type="Classes de Cotas de Fundos FII",
+        family=family,
     )
 
 
@@ -112,6 +150,118 @@ class TestExpansion:
         anchor, _entities = snapshot.expand("99999999000199")
         assert anchor is not None
         assert not anchor.active
+
+
+class TestFamilies:
+    def test_the_class_family_is_the_token_after_the_prefix(self) -> None:
+        assert class_family("Classes de Cotas de Fundos FII") == "FII"
+        assert class_family("Classes de Cotas de Fundos FIAGRO") == "FIAGRO"
+        # A parenthesised sub-kind does not change the family.
+        assert class_family("Classes de Cotas de Fundos FIF (FAPI)") == "FIF"
+        assert class_family("something else entirely") == ""
+
+    def test_the_index_fund_family_is_not_mistaken_for_a_real_estate_one(self) -> None:
+        # `FII` is a prefix of `FIIM`, so a substring test quietly admits
+        # index funds -- a different category, served under a different type.
+        assert class_family("Classes de Cotas de Fundos FIIM") == "FIIM"
+        assert "FIIM" not in SERVABLE_FAMILIES
+
+    def test_a_real_estate_fund_is_only_looked_for_under_its_own_type(self) -> None:
+        snapshot = RegistrySnapshot([_fund("1", "08431747000106", "A FII")], [], "x")
+        anchor, _entities = snapshot.expand("08431747000106")
+        assert anchor is not None
+        assert anchor.candidate_fnet_types == (1,)
+
+    def test_an_agro_fund_falls_back_to_the_real_estate_type(self) -> None:
+        # The registry types a FIAGRO-Imobiliario as `FII` and the agro-only
+        # ones as `FIAGRO`, but the split is not reliable enough to bet one
+        # request on, so the second type is tried when the first finds nothing.
+        snapshot = RegistrySnapshot(
+            [_fund("1", "57305969000198", "POLLI FIAGRO", family="FIAGRO")], [], "x"
+        )
+        anchor, _entities = snapshot.expand("57305969000198")
+        assert anchor is not None
+        assert anchor.candidate_fnet_types == (11, 1)
+
+    def test_one_cnpj_registered_under_two_families_offers_both_types(self) -> None:
+        # Real data: 72 CNPJs carry rows in more than one family. Keeping only
+        # the first row seen would decide the type by the order of the file.
+        snapshot = RegistrySnapshot(
+            [
+                _fund("1", "57305969000198", "POLLI FIAGRO"),
+                _fund("2", "57305969000198", "POLLI FIAGRO", family="FIAGRO"),
+            ],
+            [],
+            "x",
+        )
+        anchor, _entities = snapshot.expand("57305969000198")
+        assert anchor is not None
+        assert anchor.candidate_fnet_types == (1, 11)
+
+    def test_classes_of_every_registration_of_one_cnpj_are_expanded(self) -> None:
+        # A fund re-registered under a second ID_Registro_Fundo keeps classes on
+        # both; expanding only one of them would silently drop the others.
+        snapshot = RegistrySnapshot(
+            [
+                _fund("1", "59849627000164", "TRANCOSO II"),
+                _fund("2", "59849627000164", "TRANCOSO II"),
+            ],
+            [
+                _klass("10", "1", "59890241000104", "TRANCOSO II - CLASSE A"),
+                _klass("20", "2", "59891323000165", "TRANCOSO II - CLASSE B"),
+            ],
+            "x",
+        )
+        _anchor, entities = snapshot.expand("59849627000164")
+        assert {e.cnpj for e in entities} == {
+            "59849627000164",
+            "59890241000104",
+            "59891323000165",
+        }
+
+    def test_an_active_registration_describes_a_cnpj_that_also_has_a_dead_one(self) -> None:
+        snapshot = RegistrySnapshot(
+            [
+                _fund("1", "26324298000189", "OLD NAME", situation="Cancelado"),
+                _fund("2", "26324298000189", "CURRENT NAME"),
+            ],
+            [],
+            "x",
+        )
+        anchor, _entities = snapshot.expand("26324298000189")
+        assert anchor is not None
+        assert anchor.legal_name == "CURRENT NAME"
+        assert anchor.active
+
+
+class TestParsing:
+    def test_only_the_monitorable_families_survive_the_archive(self) -> None:
+        archive = _archive(
+            funds=[
+                ("1", "08431747000106", "A FII", "FII"),
+                ("2", "57305969000198", "A FIAGRO", "FIAGRO"),
+                ("3", "26324298000189", "SOMETHING ELSE", "FIF"),
+            ],
+            classes=[
+                ("10", "1", "08431747000106", "A FII", "Classes de Cotas de Fundos FII"),
+                ("11", "9", "64802589000124", "AN INDEX FUND",
+                 "Classes de Cotas de Fundos FIIM"),
+            ],
+        )
+        snapshot = parse_archive(archive)
+        assert snapshot.fund_count == 2
+        assert snapshot.class_count == 1
+        assert snapshot.lookup("26324298000189") is None
+        assert snapshot.lookup("64802589000124") is None
+        assert snapshot.lookup("57305969000198") is not None
+
+    def test_an_archive_with_nothing_monitorable_is_refused(self) -> None:
+        archive = _archive(
+            funds=[("1", "26324298000189", "SOMETHING ELSE", "FIF")],
+            classes=[],
+        )
+        with pytest.raises(ValueError):
+            parse_archive(archive)
 
 
 class TestNameSearch:

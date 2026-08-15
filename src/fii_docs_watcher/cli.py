@@ -22,7 +22,7 @@ from pathlib import Path
 from . import __version__
 from .clock import retention_window, to_dir_name, today
 from .config import CONFIG_SEARCH_PATH, Config, describe_source, load
-from .cvm.registry import RegistryCache
+from .cvm.registry import RegistryCache, servable_fund_types
 from .errors import ConfigError, LockHeldError, WatcherError
 from .fnet.client import FnetClient
 from .logging_setup import configure
@@ -413,7 +413,7 @@ def cmd_add(config: Config, args: argparse.Namespace) -> int:
     for entity in scope.entities:
         print(
             f"  entity {format_masked(entity.cnpj)}  id={entity.fundosnet_id}  "
-            f"{entity.fnet_fund_description[:60]}"
+            f"type={entity.fnet_fund_type}  {entity.fnet_fund_description[:60]}"
         )
     if not scope.entities:
         print("  not yet resolved; the next run will complete it.")
@@ -492,8 +492,9 @@ def cmd_list(config: Config, args: argparse.Namespace) -> int:
         for entity in scope.entities:
             confirmed = "confirmed" if entity.cnpj_confirmed else "unconfirmed"
             print(
-                f"    - id={entity.fundosnet_id:<8} {format_masked(entity.cnpj)}  "
-                f"[{confirmed}]  {entity.fnet_fund_description[:56]}"
+                f"    - id={entity.fundosnet_id:<8} type={entity.fnet_fund_type:<3} "
+                f"{format_masked(entity.cnpj)}  "
+                f"[{confirmed}]  {entity.fnet_fund_description[:48]}"
             )
     print()
     if query:
@@ -850,9 +851,14 @@ def cmd_doctor(config: Config, _args: argparse.Namespace) -> int:
         print(f"manifest:        FAILED - {exc}", file=sys.stderr)
 
     try:
+        counts = []
         with FnetClient(config.source) as client:
-            payload = client.get("listarTodasCategoriaPorTipoFundo", {"idTipoFundo": 1}).json()
-        print(f"fundos.net:      ok ({len(payload)} document categories)")
+            for fund_type in servable_fund_types():
+                payload = client.get(
+                    "listarTodasCategoriaPorTipoFundo", {"idTipoFundo": fund_type}
+                ).json()
+                counts.append(f"type {fund_type}: {len(payload)}")
+        print(f"fundos.net:      ok (document categories -- {', '.join(counts)})")
     except Exception as exc:
         problems.append(f"fundos.net: {exc}")
         print(f"fundos.net:      FAILED - {exc}", file=sys.stderr)
@@ -865,7 +871,7 @@ def cmd_doctor(config: Config, _args: argparse.Namespace) -> int:
             print("cvm registry:    FAILED - unavailable", file=sys.stderr)
         else:
             print(
-                f"cvm registry:    ok ({snapshot.fund_count} FII funds, "
+                f"cvm registry:    ok ({snapshot.fund_count} funds, "
                 f"{snapshot.class_count} classes)"
             )
     except Exception as exc:

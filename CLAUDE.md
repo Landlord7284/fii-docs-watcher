@@ -52,6 +52,21 @@ The config file is **discovered** — `--config` → `$FII_WATCHER_CONFIG` → `
 
 **`[download].formats`** (default `["pdf"]`) selects which formats are archived. **XML is opt-in**: the archive is a reading queue for people, and the XML is the same filing in a machine-readable shape that Pipeline B fetches for itself. Adding a format declines the others *before the request* wherever the listing allows the format to be predicted; a mispredict is declined after download with a warning. Declined documents are recorded as `skipped` rather than dropped, and `pending_downloads()` re-evaluates them every run, so widening the list picks them up without re-discovery.
 
+## Scope widened beyond real-estate funds
+
+From version 0.3.0 the robot monitors **FII and FIAGRO**, not FII alone. The spec is FII-only throughout, so this is a **stated deviation from §2.1 and §4.1** — everything else about how a fund is queried is unchanged.
+
+The mechanism generalises, deliberately: `cvm.registry.SERVABLE_FAMILIES` maps a CVM registry family to the ordered Fundos.NET fund types that can serve it (`FII → (1,)`, `FIAGRO → (11, 1)`), and enabling another category is a row in that table. The other categories the source publishes — measured on 2026-08-15 as `2` FIDC, `3` ETF, `4` ETF RF, `7` Fundo Setorial, `10` FIP — are reachable on the same code path and deliberately left off.
+
+**The fund type is per entity and discovered, never assumed.** `Entity.fnet_fund_type` is resolved once by probing `listarFundos` across the candidate types and then cached in `funds.yaml`, exactly like `fundosnet_id`. It has to be discovered because the CVM family does not decide it: a FIAGRO-Imobiliário is typed `FII` in the registry and served under type 1, while an agro-only FIAGRO is typed `FIAGRO` and answers only under type 11 — and 72 CNPJs carry rows in both families. Querying the wrong type returns an **empty result, not an error**, so a wrong guess looks exactly like a quiet fund.
+
+Consequences worth knowing:
+
+- `listing.scan()`/`probe()` and `funds.search()` take `fund_type`; the default stays `FUND_TYPE_FII` so an entity written before the field existed keeps working.
+- The global audit runs one scan per distinct type in the watch list, so it costs nothing extra until a second category is actually registered.
+- A CNPJ is indexed to **every** registry row that carries it, not the first: rows are merged so class expansion and candidate types come from all of its registrations.
+- Downgrading is not safe. An older build ignores `fnet_fund_type`, falls back to 1, and silently finds nothing for a FIAGRO entity.
+
 ## The spec is the authority
 
 `arquitetura-fii-monitor-pipeline-a-rev3.md` is the source of truth. It defines *what* and *why*, never *how*.
@@ -111,7 +126,7 @@ Section pointers refer to `arquitetura-fii-monitor-pipeline-a-rev3.md`.
 
 ## Source behavior worth not re-deriving
 
-Host `fnet.bmfbovespa.com.br`; `idTipoFundo=1` / `tipoFundo=1` means real-estate fund. No endpoint required a captcha or authenticated session (§2.1).
+Host `fnet.bmfbovespa.com.br`; `idTipoFundo=1` / `tipoFundo=1` means real-estate fund, and every other category has its own id (see the scope section above). No endpoint required a captcha or authenticated session (§2.1).
 
 | Endpoint | Use |
 |---|---|
@@ -163,6 +178,8 @@ Wire-schema facts worth not re-deriving: `fundoOuClasse` is now overwhelmingly `
 `https://dados.cvm.gov.br/dados/FI/CAD/DADOS/registro_fundo_classe.zip` (~6.7 MB, refreshed daily) contains `registro_fundo.csv`, `registro_classe.csv` and `registro_subclasse.csv`, **latin-1**, `;`-delimited. `registro_classe.csv` carries `ID_Registro_Fundo`, giving a *structural* fund→classes join.
 
 **Stated deviation from §3.2.** The spec prefers expanding classes through `listarFundos` and treats the registry's class file as a last resort, because each external dependency is permanent cost. That cost is already paid: the same ZIP is mandatory for CNPJ→legal-name, since the listing never returns a CNPJ. Given that, the structural join is used for expansion — it avoids reintroducing name-substring matching, the exact failure mode revision 3 exists to eliminate, and sidesteps the duplicate-id hazard above. `listarFundos` remains the only source of `id_fundosnet`. Watch out: the registry contains one fund whose classes are registered **twice under the same CNPJ and name**, so expansion deduplicates on `(cnpj, legal_name)`.
+
+**Family matching is exact, never a substring.** `Tipo_Classe` reads `Classes de Cotas de Fundos <FAMILY>`, and `FII` is a prefix of `FIIM` (índice de mercado) — `"FII" in tipo_classe` therefore admits index funds, which is a different category served under a different Fundos.NET type. Parse the token with `class_family()` and look it up in `SERVABLE_FAMILIES`.
 
 ## Out of scope
 

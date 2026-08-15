@@ -1,6 +1,6 @@
 # fii-docs-watcher
 
-A robot that downloads Brazilian real-estate fund (FII) documents from
+A robot that downloads Brazilian real-estate fund (FII) and FIAGRO documents from
 [Fundos.NET](https://fnet.bmfbovespa.com.br) every day and files them into per-day directories, so
 you can open today's folder and see what is new.
 

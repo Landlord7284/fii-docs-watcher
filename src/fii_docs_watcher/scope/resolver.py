@@ -4,15 +4,24 @@ The chain, and why each link exists:
 
     reference CNPJ (what the user registers)
       -> CVM registry          the listing never returns a CNPJ, so only the
-                               registry can say which fund a CNPJ names, and
-                               which classes belong to it
+                               registry can say which fund a CNPJ names, which
+                               classes belong to it, and which Fundos.NET fund
+                               types are worth trying
       -> listarFundos(name)    the Fundos.NET id is opaque and derivable from
-                               nothing; it can only be found by text search
+                               nothing; it can only be found by text search,
+                               and only within the right fund type
       -> confirm with l=1      a name match is not proof; querying the candidate
                                id confirms it exists and captures its exact
                                descricaoFundo
       -> Content-Disposition   later, on the first real download, the CNPJ in
                                the served filename closes the loop (see fetch)
+
+**On the fund type.** It is discovered, not assumed. A name is only listed under
+the category it is filed as, and searching the wrong one returns an empty result
+rather than an error -- so a wrong guess is indistinguishable from a fund that
+does not exist. The registry narrows it to a short ordered list of candidates,
+usually one, and the first type that names the entity wins. The answer is stored
+on the entity so it costs one resolution, not one per run.
 
 **On using the registry for structure.** The architecture document prefers
 expanding classes through `listarFundos` and treats the registry's class file as
@@ -42,7 +51,7 @@ from ..errors import ScopeResolutionError, TransientSourceError, WatcherError
 from ..fnet import funds as fnet_funds
 from ..fnet.client import FnetClient
 from ..fnet.funds import FundCandidate
-from ..fnet.listing import probe
+from ..fnet.listing import FUND_TYPE_FII, probe
 from ..text import fold_name
 from .models import Entity, ExpansionState, Scope, ScopeMode
 
@@ -66,13 +75,16 @@ class ResolvedCandidate:
     confirmed: bool
     fnet_description: str
     document_count: int
+    fund_type: int = FUND_TYPE_FII
 
     @property
     def fundosnet_id(self) -> int:
         return self.candidate.fundosnet_id
 
 
-def confirm_candidate(client: FnetClient, candidate: FundCandidate) -> ResolvedCandidate:
+def confirm_candidate(
+    client: FnetClient, candidate: FundCandidate, *, fund_type: int = FUND_TYPE_FII
+) -> ResolvedCandidate:
     """Query a candidate id over a wide window to prove it exists.
 
     One request, via `probe`. A candidate that returns no documents is not
@@ -84,16 +96,26 @@ def confirm_candidate(client: FnetClient, candidate: FundCandidate) -> ResolvedC
     first = last - timedelta(days=CONFIRMATION_LOOKBACK_DAYS)
     log.info(
         "confirming a candidate against the listing (one request; the source can take ~60s)",
-        extra={"fundosnet_id": candidate.fundosnet_id, "candidate": candidate.text[:70]},
+        extra={
+            "fundosnet_id": candidate.fundosnet_id,
+            "fund_type": fund_type,
+            "candidate": candidate.text[:70],
+        },
     )
     try:
-        result = probe(client, first=first, last=last, fundosnet_id=candidate.fundosnet_id)
+        result = probe(
+            client,
+            first=first,
+            last=last,
+            fundosnet_id=candidate.fundosnet_id,
+            fund_type=fund_type,
+        )
     except (TransientSourceError, WatcherError) as exc:
         log.warning(
             "could not confirm a candidate id against the listing",
             extra={"fundosnet_id": candidate.fundosnet_id, "error": str(exc)},
         )
-        return ResolvedCandidate(candidate, False, candidate.denomination, 0)
+        return ResolvedCandidate(candidate, False, candidate.denomination, 0, fund_type)
 
     description = (
         result.first_row.fund_description if result.first_row else candidate.denomination
@@ -103,60 +125,84 @@ def confirm_candidate(client: FnetClient, candidate: FundCandidate) -> ResolvedC
         confirmed=result.exists,
         fnet_description=description,
         document_count=result.records_filtered,
+        fund_type=fund_type,
     )
 
 
-def find_candidates(client: FnetClient, term: str) -> list[FundCandidate]:
+def find_candidates(
+    client: FnetClient, term: str, *, fund_type: int = FUND_TYPE_FII
+) -> list[FundCandidate]:
     """Search Fundos.NET by name. Used by the interactive CLI path."""
-    return fnet_funds.search(client, term)
+    return fnet_funds.search(client, term, fund_type=fund_type)
 
 
-def _pick(
-    candidates: list[FundCandidate], target_name: str, client: FnetClient
-) -> ResolvedCandidate | None:
-    """Choose the id for one entity, preferring an exact name match.
+def _shortlist(candidates: list[FundCandidate], target_name: str) -> list[FundCandidate]:
+    """Narrow a name search to the plausible ids, preferring an exact match.
 
     `listarFundos` matches on substring, so a search for one fund routinely
     returns its classes and unrelated funds sharing a word. It also returns
-    genuine duplicates: one class name resolves to two different ids. So
-    candidates are ranked rather than taken in order, and every finalist is
-    confirmed against the listing before being trusted.
+    genuine duplicates: one class name resolves to two different ids.
     """
-    if not candidates:
-        return None
-
     wanted = normalize_name(target_name)
     exact = [c for c in candidates if normalize_name(c.denomination) == wanted]
-    shortlist = exact or [
+    if exact:
+        return exact
+    return [
         c
         for c in candidates
         if wanted and (wanted in normalize_name(c.text) or normalize_name(c.text) in wanted)
     ]
-    if not shortlist:
-        return None
 
-    # A handful only; needing more means the name is too generic to resolve
-    # unattended, and the interactive CLI path is the right tool for that.
-    checked = [confirm_candidate(client, candidate) for candidate in shortlist[:5]]
 
-    # Prefer a candidate that actually has documents; among equals, the one with
-    # the most, since a duplicate registration is typically the empty one.
-    checked.sort(key=lambda r: (r.confirmed, r.document_count), reverse=True)
-    best = checked[0]
+def _pick(
+    client: FnetClient, target_name: str, fund_types: tuple[int, ...]
+) -> ResolvedCandidate | None:
+    """Choose the id and the fund type for one entity.
 
-    if len(shortlist) > 1:
-        log.info(
-            "several ids matched one name; picked the one with documents",
-            extra={
-                "target": target_name[:80],
-                "picked": best.fundosnet_id,
-                "documents": best.document_count,
-                "others": [
-                    c.fundosnet_id for c in shortlist if c.fundosnet_id != best.fundosnet_id
-                ],
-            },
-        )
-    return best
+    The type has to be discovered, not assumed: a name is only listed under the
+    category it is filed as, and querying the wrong one returns an empty result
+    rather than an error. The CVM registry narrows it to a short ordered list of
+    candidates -- usually one -- and the first type that names the entity wins.
+
+    Within a type, candidates are ranked rather than taken in order, and every
+    finalist is confirmed against the listing before being trusted.
+    """
+    for fund_type in fund_types or (FUND_TYPE_FII,):
+        candidates = find_candidates(client, target_name, fund_type=fund_type)
+        shortlist = _shortlist(candidates, target_name)
+        if not shortlist:
+            continue
+
+        # A handful only; needing more means the name is too generic to resolve
+        # unattended, and the interactive CLI path is the right tool for that.
+        checked = [
+            confirm_candidate(client, candidate, fund_type=fund_type)
+            for candidate in shortlist[:5]
+        ]
+
+        # Prefer a candidate that actually has documents; among equals, the one
+        # with the most, since a duplicate registration is typically the empty one.
+        checked.sort(key=lambda r: (r.confirmed, r.document_count), reverse=True)
+        best = checked[0]
+
+        if len(shortlist) > 1:
+            log.info(
+                "several ids matched one name; picked the one with documents",
+                extra={
+                    "target": target_name[:80],
+                    "picked": best.fundosnet_id,
+                    "fund_type": fund_type,
+                    "documents": best.document_count,
+                    "others": [
+                        c.fundosnet_id
+                        for c in shortlist
+                        if c.fundosnet_id != best.fundosnet_id
+                    ],
+                },
+            )
+        return best
+
+    return None
 
 
 def _entity_from(resolved: ResolvedCandidate, registry_entity: RegistryEntity) -> Entity:
@@ -165,6 +211,7 @@ def _entity_from(resolved: ResolvedCandidate, registry_entity: RegistryEntity) -
         fundosnet_id=resolved.fundosnet_id,
         fnet_fund_description=resolved.fnet_description,
         kind=registry_entity.kind,
+        fnet_fund_type=resolved.fund_type,
         validated_at=to_dir_name(today()),
         cnpj_confirmed=False,
     )
@@ -187,7 +234,8 @@ def resolve_scope(
     anchor, registry_entities = snapshot.expand(cnpj)
     if anchor is None:
         raise ScopeResolutionError(
-            f"CNPJ {scope.cnpj} is not a registered FII fund or class in the CVM registry",
+            f"CNPJ {scope.cnpj} is not a fund or class this robot can monitor: the CVM "
+            "registry holds no entry for it in a category Fundos.NET publishes",
             context={"cnpj": cnpj},
         )
 
@@ -226,10 +274,14 @@ def resolve_scope(
                 "entity %d/%d: searching Fundos.NET by name",
                 position,
                 total,
-                extra={"entity_cnpj": registry_entity.cnpj},
+                extra={
+                    "entity_cnpj": registry_entity.cnpj,
+                    "fund_types": list(registry_entity.candidate_fnet_types),
+                },
             )
-            candidates = find_candidates(client, registry_entity.legal_name)
-            best = _pick(candidates, registry_entity.legal_name, client)
+            best = _pick(
+                client, registry_entity.legal_name, registry_entity.candidate_fnet_types
+            )
         except (TransientSourceError, WatcherError) as exc:
             failures += 1
             log.warning(

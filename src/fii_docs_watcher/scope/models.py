@@ -49,6 +49,11 @@ class Entity:
     fundosnet_id: int
     fnet_fund_description: str = ""
     kind: str = "fund_or_class"
+    # Which Fundos.NET fund type answers for this entity. Discovered during
+    # resolution and cached like the id, because a query sent under the wrong
+    # type returns an empty result rather than an error. The default keeps watch
+    # lists written before this field was introduced working unchanged.
+    fnet_fund_type: int = 1
     validated_at: str | None = None
     # Set once a download's Content-Disposition CNPJ has confirmed this entity.
     # Until then the name -> id resolution is textual and unproven.

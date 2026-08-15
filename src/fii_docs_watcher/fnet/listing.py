@@ -40,7 +40,9 @@ SEARCH_PATH = "pesquisarGerenciadorDocumentosDados"
 # The only ordering this endpoint honours. Changing it re-opens silent row loss.
 STABLE_SORT = {"o[0][dataEntrega]": "asc"}
 
-# `idTipoFundo` / `tipoFundo` = 1 selects real-estate funds.
+# `idTipoFundo` / `tipoFundo` = 1 selects real-estate funds. Other categories
+# answer under their own id and return nothing under this one, so the type
+# travels with the entity rather than being assumed; see `cvm.registry`.
 FUND_TYPE_FII = 1
 
 # A scan re-runs at most this many times before the shortfall is reported.
@@ -86,6 +88,7 @@ def _search_params(
     first: date,
     last: date,
     fundosnet_id: int | None,
+    fund_type: int,
 ) -> dict[str, Any]:
     """Build one search request.
 
@@ -97,7 +100,7 @@ def _search_params(
         "d": 1,
         "s": start,
         "l": length,
-        "tipoFundo": FUND_TYPE_FII,
+        "tipoFundo": fund_type,
         "dataInicial": to_wire_date(first),
         "dataFinal": to_wire_date(last),
         "idCategoriaDocumento": 0,
@@ -118,6 +121,7 @@ def _pages(
     last: date,
     fundosnet_id: int | None,
     page_length: int,
+    fund_type: int,
 ) -> Iterator[tuple[list[dict[str, Any]], int]]:
     """Yield `(raw rows, recordsFiltered)` page by page until the set is covered."""
     start = 0
@@ -126,7 +130,12 @@ def _pages(
         payload = client.get(
             SEARCH_PATH,
             _search_params(
-                start=start, length=page_length, first=first, last=last, fundosnet_id=fundosnet_id
+                start=start,
+                length=page_length,
+                first=first,
+                last=last,
+                fundosnet_id=fundosnet_id,
+                fund_type=fund_type,
             ),
         ).json()
         if not isinstance(payload, dict) or "data" not in payload:
@@ -150,7 +159,12 @@ def _pages(
 
 
 def probe(
-    client: FnetClient, *, first: date, last: date, fundosnet_id: int
+    client: FnetClient,
+    *,
+    first: date,
+    last: date,
+    fundosnet_id: int,
+    fund_type: int = FUND_TYPE_FII,
 ) -> ProbeResult:
     """Confirm an entity id is real, in exactly one request.
 
@@ -166,7 +180,14 @@ def probe(
     """
     payload = client.get(
         SEARCH_PATH,
-        _search_params(start=0, length=1, first=first, last=last, fundosnet_id=fundosnet_id),
+        _search_params(
+            start=0,
+            length=1,
+            first=first,
+            last=last,
+            fundosnet_id=fundosnet_id,
+            fund_type=fund_type,
+        ),
     ).json()
     if not isinstance(payload, dict) or "data" not in payload:
         raise SourceContractError(
@@ -191,6 +212,7 @@ def scan(
     last: date,
     fundosnet_id: int | None = None,
     page_length: int = 200,
+    fund_type: int = FUND_TYPE_FII,
 ) -> ScanResult:
     """Scan `[first, last]` by delivery date, optionally narrowed to one entity.
 
@@ -204,7 +226,8 @@ def scan(
     is returned with `complete` false -- callers must check it before treating
     the window as fully scanned.
     """
-    label = f"idFundo={fundosnet_id}" if fundosnet_id is not None else "global"
+    target = f"idFundo={fundosnet_id}" if fundosnet_id is not None else "global"
+    label = f"{target} tipoFundo={fund_type}"
     last_result: ScanResult | None = None
 
     for attempt in range(1, MAX_SCAN_ATTEMPTS + 1):
@@ -219,6 +242,7 @@ def scan(
             last=last,
             fundosnet_id=fundosnet_id,
             page_length=page_length,
+            fund_type=fund_type,
         ):
             pages += 1
             records_filtered = max(records_filtered, total)

@@ -26,7 +26,8 @@ from ..clock import today
 from ..config import AuditConfig
 from ..errors import TransientSourceError, WatcherError
 from ..fnet.client import FnetClient
-from ..fnet.listing import scan
+from ..fnet.listing import FUND_TYPE_FII, scan
+from ..fnet.schema import DocumentRow
 from ..manifest.repo import ManifestRepo
 from ..scope.models import Scope
 from ..scope.resolver import normalize_name
@@ -78,36 +79,51 @@ def run(
     # included, because the two spellings diverge routinely.
     monitored: dict[str, Scope] = {}
     known_ids: set[int] = set()
+    fund_types: dict[int, None] = {}
     for scope in scopes:
         for name in (scope.legal_name, *(e.fnet_fund_description for e in scope.entities)):
             folded = normalize_name(name or "")
             if folded:
                 monitored.setdefault(folded, scope)
         known_ids.update(e.fundosnet_id for e in scope.entities)
+        # The global listing is per fund type, so a watch list spanning
+        # categories needs one scan each. Only the types actually monitored are
+        # scanned: an all-FII watch list costs exactly one request-set, as before.
+        for entity in scope.entities:
+            fund_types.setdefault(entity.fnet_fund_type, None)
 
     if not monitored:
         return report
 
-    try:
-        # Yesterday and today: a document delivered late in the day can be
-        # missed by a run that happened before it landed.
-        result = scan(client, first=day - timedelta(days=1), last=day, page_length=200)
-    except (TransientSourceError, WatcherError) as exc:
-        report.error = str(exc)
-        log.warning(
-            "the global audit scan failed; this does not affect the archive",
-            extra={"error": str(exc)},
-        )
-        return report
+    rows: list[DocumentRow] = []
+    for fund_type in fund_types or {FUND_TYPE_FII: None}:
+        try:
+            # Yesterday and today: a document delivered late in the day can be
+            # missed by a run that happened before it landed.
+            result = scan(
+                client,
+                first=day - timedelta(days=1),
+                last=day,
+                page_length=200,
+                fund_type=fund_type,
+            )
+        except (TransientSourceError, WatcherError) as exc:
+            report.error = str(exc)
+            log.warning(
+                "a global audit scan failed; this does not affect the archive",
+                extra={"error": str(exc), "fund_type": fund_type},
+            )
+            continue
+        rows.extend(result.rows)
 
-    report.documents_examined = len(result.rows)
+    report.documents_examined = len(rows)
     captured = {
         identity
         for fundosnet_id in known_ids
         for identity in repo.known_identities_for_entity(fundosnet_id)
     }
 
-    for row in result.rows:
+    for row in rows:
         scope = monitored.get(normalize_name(row.fund_description))
         if scope is None or row.identity in captured:
             continue
@@ -133,6 +149,7 @@ def run(
             "examined": report.documents_examined,
             "unmatched": len(report.unmatched),
             "scopes": len(scopes),
+            "fund_types": list(fund_types),
         },
     )
     return report

@@ -83,12 +83,19 @@ def _parse(payload: Any) -> tuple[list[FundCandidate], bool]:
     return candidates, bool(payload.get("more"))
 
 
-def search(client: FnetClient, term: str) -> list[FundCandidate]:
+def search(
+    client: FnetClient, term: str, *, fund_type: int = FUND_TYPE_FII
+) -> list[FundCandidate]:
     """Find every entity whose name contains `term`, following all pages.
 
     Results are deduplicated by id while preserving order, because the same id
     can legitimately appear on more than one page when the underlying set shifts
     mid-scan.
+
+    `fund_type` selects the catalogue to search. A name is only ever found under
+    the type it is filed as, so searching the wrong one returns nothing at all
+    rather than an error -- which is why the caller tries the candidates the CVM
+    registry suggests instead of assuming one.
     """
     term = term.strip()
     if not term:
@@ -101,7 +108,7 @@ def search(client: FnetClient, term: str) -> list[FundCandidate]:
             {
                 "term": term,
                 "page": page,
-                "idTipoFundo": FUND_TYPE_FII,
+                "idTipoFundo": fund_type,
                 "idAdm": 0,
                 "paraCerts": "false",
             },
@@ -117,5 +124,8 @@ def search(client: FnetClient, term: str) -> list[FundCandidate]:
             extra={"term": term, "pages": MAX_PAGES, "found": len(found)},
         )
 
-    log.debug("listarFundos resolved", extra={"term": term, "candidates": len(found)})
+    log.debug(
+        "listarFundos resolved",
+        extra={"term": term, "fund_type": fund_type, "candidates": len(found)},
+    )
     return list(found.values())

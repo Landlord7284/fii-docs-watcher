@@ -28,6 +28,7 @@ import io
 import json
 import logging
 import zipfile
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -47,10 +48,23 @@ CLASS_FILE = "registro_classe.csv"
 ENCODING = "latin-1"
 DELIMITER = ";"
 
-# `Tipo_Fundo` in registro_fundo.csv; `Tipo_Classe` in registro_classe.csv reads
-# "Classes de Cotas de Fundos FII".
-FII_FUND_TYPE = "FII"
-FII_CLASS_MARKER = "FII"
+# The registry families this robot monitors, mapped to the Fundos.NET fund-type
+# ids that can serve them, in the order they should be tried.
+#
+# FIAGRO carries two because the split does not follow the name: the registry
+# types a FIAGRO-Imobiliario as `FII`, and those are served under type 1 like any
+# other real-estate fund, while the agro-only ones are typed `FIAGRO` and answer
+# only under type 11. Since one CNPJ can be registered under both families, the
+# family cannot decide the type on its own -- it proposes candidates and
+# `listarFundos` settles it. Enabling another category later is a row here.
+SERVABLE_FAMILIES: dict[str, tuple[int, ...]] = {
+    "FII": (1,),
+    "FIAGRO": (11, 1),
+}
+
+# `Tipo_Classe` reads "Classes de Cotas de Fundos <FAMILY>", sometimes with a
+# parenthesised sub-kind ("... FIF (FAPI)").
+_CLASS_PREFIX = "classes de cotas de fundos "
 
 # Situations that mean the entity is gone. Kept as a denylist because CVM adds
 # wording over time and a new active-ish status should not silently disable a scope.
@@ -66,7 +80,7 @@ class RegisteredFund:
     cvm_code: str
     legal_name: str
     situation: str
-    fund_type: str
+    family: str
 
 
 @dataclass(frozen=True)
@@ -77,7 +91,7 @@ class RegisteredClass:
     cvm_code: str
     legal_name: str
     situation: str
-    class_type: str
+    family: str
 
 
 @dataclass(frozen=True)
@@ -89,10 +103,48 @@ class RegistryEntity:
     cvm_code: str
     situation: str
     kind: str  # "fund" | "class"
+    # Fundos.NET fund-type ids worth trying for this entity, best guess first.
+    candidate_fnet_types: tuple[int, ...] = (1,)
 
     @property
     def active(self) -> bool:
-        return (self.situation or "").strip().lower() not in DEAD_SITUATIONS
+        return _is_active(self.situation)
+
+
+def _is_active(situation: str) -> bool:
+    return (situation or "").strip().lower() not in DEAD_SITUATIONS
+
+
+def class_family(tipo_classe: str) -> str:
+    """Extract the family token from a `Tipo_Classe` value.
+
+    A substring test is not good enough: `FII` is a prefix of `FIIM`, the
+    index-fund family, so `"FII" in tipo_classe` quietly admits entities that are
+    not real-estate funds at all.
+    """
+    text = (tipo_classe or "").strip()
+    if not text.lower().startswith(_CLASS_PREFIX):
+        return ""
+    family, _, _ = text[len(_CLASS_PREFIX) :].partition("(")
+    return family.strip().upper()
+
+
+def servable_fund_types() -> tuple[int, ...]:
+    """Every Fundos.NET fund type a monitorable family can be served under."""
+    return _merge_candidate_types(SERVABLE_FAMILIES)
+
+
+def _merge_candidate_types(families: Iterable[str]) -> tuple[int, ...]:
+    """Union the candidate types of every family a CNPJ is registered under.
+
+    Order is preserved and duplicates dropped, so the best guess of the first
+    family stays first and a second registration only ever adds fallbacks.
+    """
+    merged: dict[int, None] = {}
+    for family in families:
+        for fund_type in SERVABLE_FAMILIES.get(family, ()):
+            merged.setdefault(fund_type, None)
+    return tuple(merged)
 
 
 class RegistrySnapshot:
@@ -110,16 +162,19 @@ class RegistrySnapshot:
         fetched_at: str,
     ) -> None:
         self.fetched_at = fetched_at
-        self._funds_by_cnpj: dict[str, RegisteredFund] = {}
-        self._funds_by_registry_id: dict[str, RegisteredFund] = {}
-        self._classes_by_cnpj: dict[str, RegisteredClass] = {}
+        # Both CNPJ indexes hold *every* row for that CNPJ, not the first one.
+        # A fund can be registered under more than one family and under more
+        # than one `ID_Registro_Fundo`, and each registration carries its own
+        # classes and its own candidate types -- keeping one row would decide
+        # both by the order rows happen to appear in the file.
+        self._funds_by_cnpj: dict[str, list[RegisteredFund]] = {}
+        self._classes_by_cnpj: dict[str, list[RegisteredClass]] = {}
         self._classes_by_fund: dict[str, list[RegisteredClass]] = {}
 
         for fund in funds:
-            self._funds_by_cnpj.setdefault(fund.cnpj, fund)
-            self._funds_by_registry_id.setdefault(fund.registry_id, fund)
+            self._funds_by_cnpj.setdefault(fund.cnpj, []).append(fund)
         for klass in classes:
-            self._classes_by_cnpj.setdefault(klass.cnpj, klass)
+            self._classes_by_cnpj.setdefault(klass.cnpj, []).append(klass)
             self._classes_by_fund.setdefault(klass.fund_registry_id, []).append(klass)
 
     def __len__(self) -> int:
@@ -150,39 +205,39 @@ class RegistrySnapshot:
         if key is None:
             return None, []
 
-        klass = self._classes_by_cnpj.get(key)
-        fund = self._funds_by_cnpj.get(key)
+        classes = self._classes_by_cnpj.get(key)
+        funds = self._funds_by_cnpj.get(key)
 
-        if fund is not None:
+        if funds:
             # Deduplicated on (CNPJ, legal name): the registry contains at least
             # one fund whose classes are registered twice under the same CNPJ and
             # the same name. Left in, the duplicate would make the robot query
             # and archive the same entity twice.
             entities: list[RegistryEntity] = []
             seen: set[tuple[str, str]] = set()
-            siblings = self._classes_by_fund.get(fund.registry_id, [])
-            for sibling in siblings:
-                entity = _class_entity(sibling)
-                key_pair = (entity.cnpj, entity.legal_name)
-                if entity.active and key_pair not in seen:
-                    seen.add(key_pair)
-                    entities.append(entity)
+            for fund in funds:
+                for sibling in self._classes_by_fund.get(fund.registry_id, []):
+                    entity = _class_entity([sibling])
+                    key_pair = (entity.cnpj, entity.legal_name)
+                    if entity.active and key_pair not in seen:
+                        seen.add(key_pair)
+                        entities.append(entity)
 
-            anchor = _fund_entity(fund)
+            anchor = _fund_entity(funds)
             # Monoclass: the fund and its only class share the CNPJ, so listing
             # both would query the same entity twice.
             if not any(entity.cnpj == anchor.cnpj for entity in entities):
                 entities.insert(0, anchor)
             return anchor, entities
 
-        if klass is not None:
-            entity = _class_entity(klass)
+        if classes:
+            entity = _class_entity(classes)
             return entity, [entity]
 
         return None, []
 
     def search_by_name(self, term: str, *, limit: int = 25) -> list[RegistryEntity]:
-        """Find FII funds and classes whose legal name contains `term`.
+        """Find monitorable funds and classes whose legal name contains `term`.
 
         This is what makes registering by name workable: Fundos.NET can search
         by name but never returns a CNPJ, while a scope is registered *by* CNPJ.
@@ -198,16 +253,16 @@ class RegistrySnapshot:
 
         seen: set[str] = set()
         matches: list[RegistryEntity] = []
-        for fund in self._funds_by_cnpj.values():
-            if needle in fold_name(fund.legal_name):
-                entity = _fund_entity(fund)
+        for funds in self._funds_by_cnpj.values():
+            if any(needle in fold_name(fund.legal_name) for fund in funds):
+                entity = _fund_entity(funds)
                 seen.add(entity.cnpj)
                 matches.append(entity)
-        for klass in self._classes_by_cnpj.values():
-            if klass.cnpj in seen:
+        for classes in self._classes_by_cnpj.values():
+            if classes[0].cnpj in seen:
                 continue  # Monoclass: the fund already represents it.
-            if needle in fold_name(klass.legal_name):
-                matches.append(_class_entity(klass))
+            if any(needle in fold_name(klass.legal_name) for klass in classes):
+                matches.append(_class_entity(classes))
 
         matches.sort(key=lambda e: (not e.active, e.kind != "fund", e.legal_name))
         return matches[:limit]
@@ -217,30 +272,43 @@ class RegistrySnapshot:
         key = normalize(cnpj)
         if key is None:
             return None
-        klass = self._classes_by_cnpj.get(key)
-        if klass is not None:
-            return _class_entity(klass)
-        fund = self._funds_by_cnpj.get(key)
-        return _fund_entity(fund) if fund is not None else None
+        classes = self._classes_by_cnpj.get(key)
+        if classes:
+            return _class_entity(classes)
+        funds = self._funds_by_cnpj.get(key)
+        return _fund_entity(funds) if funds else None
 
 
-def _fund_entity(fund: RegisteredFund) -> RegistryEntity:
+def _primary[RowT: (RegisteredFund, RegisteredClass)](rows: list[RowT]) -> RowT:
+    """The row whose descriptive fields represent the CNPJ.
+
+    An active registration beats a cancelled one; a fund re-registered after a
+    cancellation would otherwise be described by the dead row.
+    """
+    return next((row for row in rows if _is_active(row.situation)), rows[0])
+
+
+def _fund_entity(funds: list[RegisteredFund]) -> RegistryEntity:
+    primary = _primary(funds)
     return RegistryEntity(
-        cnpj=fund.cnpj,
-        legal_name=fund.legal_name,
-        cvm_code=fund.cvm_code,
-        situation=fund.situation,
+        cnpj=primary.cnpj,
+        legal_name=primary.legal_name,
+        cvm_code=primary.cvm_code,
+        situation=primary.situation,
         kind="fund",
+        candidate_fnet_types=_merge_candidate_types(fund.family for fund in funds),
     )
 
 
-def _class_entity(klass: RegisteredClass) -> RegistryEntity:
+def _class_entity(classes: list[RegisteredClass]) -> RegistryEntity:
+    primary = _primary(classes)
     return RegistryEntity(
-        cnpj=klass.cnpj,
-        legal_name=klass.legal_name,
-        cvm_code=klass.cvm_code,
-        situation=klass.situation,
+        cnpj=primary.cnpj,
+        legal_name=primary.legal_name,
+        cvm_code=primary.cvm_code,
+        situation=primary.situation,
         kind="class",
+        candidate_fnet_types=_merge_candidate_types(klass.family for klass in classes),
     )
 
 
@@ -251,7 +319,7 @@ def _read_csv(archive: zipfile.ZipFile, name: str) -> list[dict[str, str]]:
 
 
 def parse_archive(data: bytes) -> RegistrySnapshot:
-    """Parse the registry ZIP into a snapshot, keeping only FII entities.
+    """Parse the registry ZIP into a snapshot of the monitorable families.
 
     Raises on a truncated or malformed archive so the caller can keep the
     previous snapshot instead of installing a broken one.
@@ -264,7 +332,8 @@ def parse_archive(data: bytes) -> RegistrySnapshot:
 
         funds: list[RegisteredFund] = []
         for row in _read_csv(archive, FUND_FILE):
-            if (row.get("Tipo_Fundo") or "").strip().upper() != FII_FUND_TYPE:
+            family = (row.get("Tipo_Fundo") or "").strip().upper()
+            if family not in SERVABLE_FAMILIES:
                 continue
             cnpj = normalize(row.get("CNPJ_Fundo"))
             if cnpj is None:
@@ -276,14 +345,14 @@ def parse_archive(data: bytes) -> RegistrySnapshot:
                     cvm_code=(row.get("Codigo_CVM") or "").strip(),
                     legal_name=(row.get("Denominacao_Social") or "").strip(),
                     situation=(row.get("Situacao") or "").strip(),
-                    fund_type=(row.get("Tipo_Fundo") or "").strip(),
+                    family=family,
                 )
             )
 
         classes: list[RegisteredClass] = []
         for row in _read_csv(archive, CLASS_FILE):
-            class_type = (row.get("Tipo_Classe") or "").strip()
-            if FII_CLASS_MARKER not in class_type.upper():
+            family = class_family(row.get("Tipo_Classe") or "")
+            if family not in SERVABLE_FAMILIES:
                 continue
             cnpj = normalize(row.get("CNPJ_Classe"))
             if cnpj is None:
@@ -296,12 +365,12 @@ def parse_archive(data: bytes) -> RegistrySnapshot:
                     cvm_code=(row.get("Codigo_CVM") or "").strip(),
                     legal_name=(row.get("Denominacao_Social") or "").strip(),
                     situation=(row.get("Situacao") or "").strip(),
-                    class_type=class_type,
+                    family=family,
                 )
             )
 
     if not funds and not classes:
-        raise ValueError("registry archive contained no FII funds or classes")
+        raise ValueError("registry archive contained no monitorable funds or classes")
 
     return RegistrySnapshot(funds, classes, fetched_at=timestamp())
 

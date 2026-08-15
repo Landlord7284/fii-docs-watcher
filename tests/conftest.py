@@ -116,13 +116,16 @@ class FakeFnet:
     """An in-process stand-in for Fundos.NET.
 
     Deliberately honours the real quirks: `idFundo=0` returns nothing, the
-    listing never echoes `idFundo`, and paging respects `s`/`l`.
+    listing never echoes `idFundo`, paging respects `s`/`l`, and an entity is
+    invisible under any fund type but its own -- the wrong type returns an empty
+    result rather than an error, which is what makes the type worth discovering.
     """
 
     def __init__(self) -> None:
         # fundosnet_id -> rows
         self.documents: dict[int, list[dict]] = {}
-        self.funds: dict[str, list[dict]] = {}
+        self.fund_types: dict[int, int] = {}
+        self.funds: dict[tuple[int, str], list[dict]] = {}
         self.payloads: dict[int, bytes] = {}
         self.content_type: dict[int, str] = {}
         self.disposition: dict[int, str] = {}
@@ -131,8 +134,9 @@ class FakeFnet:
 
     # ------------------------------------------------------------------ setup
 
-    def add_documents(self, fundosnet_id: int, rows: list[dict]) -> None:
+    def add_documents(self, fundosnet_id: int, rows: list[dict], *, fund_type: int = 1) -> None:
         self.documents.setdefault(fundosnet_id, []).extend(rows)
+        self.fund_types.setdefault(fundosnet_id, fund_type)
         for row in rows:
             self.payloads.setdefault(row["id"], SAMPLE_XML)
             self.content_type.setdefault(row["id"], "text/xml; charset=UTF-8")
@@ -143,8 +147,8 @@ class FakeFnet:
                 f"V{row['versao']:02d}-{row['id']:09d}.xml\"",
             )
 
-    def add_fund(self, term: str, entries: list[dict]) -> None:
-        self.funds[term.upper()] = entries
+    def add_fund(self, term: str, entries: list[dict], *, fund_type: int = 1) -> None:
+        self.funds[(fund_type, term.upper())] = entries
 
     # ---------------------------------------------------------------- handler
 
@@ -165,12 +169,20 @@ class FakeFnet:
 
     def _search(self, params: dict) -> httpx.Response:
         rows: list[dict]
+        fund_type = int(params.get("tipoFundo", 1))
         if "idFundo" in params:
             fundosnet_id = int(params["idFundo"])
             # Verified: 0 is not "all", it is a nonexistent id.
             rows = [] if fundosnet_id == 0 else list(self.documents.get(fundosnet_id, []))
+            if self.fund_types.get(fundosnet_id, 1) != fund_type:
+                rows = []
         else:
-            rows = [row for group in self.documents.values() for row in group]
+            rows = [
+                row
+                for fundosnet_id, group in self.documents.items()
+                if self.fund_types.get(fundosnet_id, 1) == fund_type
+                for row in group
+            ]
 
         first = _parse_wire(params.get("dataInicial"))
         last = _parse_wire(params.get("dataFinal"))
@@ -200,8 +212,11 @@ class FakeFnet:
     def _list_funds(self, params: dict) -> httpx.Response:
         term = str(params.get("term", "")).upper()
         page = int(params.get("page", 1))
+        fund_type = int(params.get("idTipoFundo", 1))
         matches: list[dict] = []
-        for key, entries in self.funds.items():
+        for (key_type, key), entries in self.funds.items():
+            if key_type != fund_type:
+                continue
             if key in term or term in key:
                 matches.extend(entries)
         # Real behaviour: 20 per page, with a `more` flag.

@@ -184,6 +184,10 @@ CNPJ monitors the fund and its active classes. Registering a *class* CNPJ monito
 `--name` searches the CVM registry (local, instant) and shows the CNPJ of each match, because
 Fundos.NET can search by name but never returns a CNPJ. After you pick, it offers to set a ticker.
 
+Real-estate funds (FII) and FIAGRO can be registered. The other categories Fundos.NET publishes
+are a possible extension: enabling one costs an extra daily audit scan, and a category that files
+mostly structured documents needs `formats` widened beyond the `pdf` default to archive anything.
+
 | Flag | Effect |
 |---|---|
 | `--ticker ABCD11` | Your annotation, used as the filename prefix. The robot never invents or validates it. |

@@ -73,6 +73,7 @@ def discover_entity(
         last=window.last,
         fundosnet_id=entity.fundosnet_id,
         page_length=page_length,
+        fund_type=entity.fnet_fund_type,
     )
 
     report.documents_seen += len(result.rows)

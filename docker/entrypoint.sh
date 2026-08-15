@@ -45,6 +45,15 @@ fi
 : "${FII_WATCHER_CONFIG:=/config/config.toml}"
 export FII_WATCHER_CONFIG
 
+# `--version` and `--help` answer from the binary alone. Demanding a config
+# file for them would make the two commands someone reaches for first fail on
+# an image that is working perfectly.
+case "${1:-}" in
+    --version | -h | --help)
+        exec fii-docs-watcher "$@"
+        ;;
+esac
+
 if [ ! -f "$FII_WATCHER_CONFIG" ]; then
     # The application would refuse to start anyway -- an explicitly named
     # config file that does not exist is an error, never a fallback -- but it

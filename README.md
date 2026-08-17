@@ -71,6 +71,15 @@ docker compose run --rm watcher add --cnpj 12.345.678/0001-90 --ticker ABCD11
 docker compose logs -f
 ```
 
+Those go through the entrypoint, which drops to `PUID:PGID` on its own. A command run inside the
+container that is already up skips it and runs as root, and what root writes there blocks the
+scheduled run, so pass the uid explicitly:
+
+```bash
+# ~/.zshrc or ~/.bashrc; same numbers as PUID/PGID in .env
+alias fii='docker compose -f /path/to/compose.yaml exec -u 1000:1000 watcher fii-docs-watcher'
+```
+
 ## Documentation
 
 - **[USAGE.md](USAGE.md)** — the full command reference: every subcommand, every setting,

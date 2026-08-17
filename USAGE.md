@@ -54,6 +54,18 @@ docker compose run --rm watcher status
 docker compose run --rm watcher add --name "fund name"   # interactive; a TTY is attached
 ```
 
+Those start a new container, which goes through the entrypoint and drops to `PUID:PGID` on its own.
+Running a command inside the container that is already up skips the entrypoint and therefore runs as
+root, and what root writes there cannot be overwritten by the scheduled run afterwards. Pass the uid
+explicitly — worth an alias in `~/.zshrc` or `~/.bashrc`:
+
+```bash
+alias fii='docker compose -f /path/to/compose.yaml exec -u 1000:1000 watcher fii-docs-watcher'
+```
+
+Use the same numbers as `PUID`/`PGID` in `.env`. Set to `0`, the container runs as root and `-u` is
+redundant; leaving them unset is not the same thing, since the entrypoint then defaults to 1000.
+
 `config.toml` is mounted and configures the robot exactly as it does outside a container. `.env`
 holds only what has no place in it:
 

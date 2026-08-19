@@ -43,6 +43,11 @@ class LocalState(StrEnum):
     # Kept rather than deleted: it is still a true record of what the source
     # published while the fund was being watched.
     ABANDONED = "abandoned"
+    # A corrected re-filing replaced this publication, so its file was deleted
+    # while the replacement stays. Distinct from `purged` on purpose: `purged`
+    # has to keep meaning "aged past the retention frontier" and nothing else,
+    # or the archive can no longer explain why a file is gone.
+    SUPERSEDED = "superseded"
 
 
 class AttemptOutcome(StrEnum):
@@ -85,7 +90,16 @@ class ManifestDocument:
     downloaded_at: str | None
     purged_at: str | None
     superseded_at: str | None
+    superseded_by_id: int | None
+    superseded_by_version: int | None
     seen_at: str
+
+    @property
+    def superseded_by(self) -> tuple[int, int] | None:
+        """Identity of the publication that replaced this one, if any."""
+        if self.superseded_by_id is None or self.superseded_by_version is None:
+            return None
+        return (self.superseded_by_id, self.superseded_by_version)
 
     @property
     def identity(self) -> tuple[int, int]:
@@ -168,20 +182,69 @@ class ManifestRepo:
         # rowcount is 1 for a fresh insert and 2 for an upsert that updated.
         return cursor.rowcount == 1
 
-    def mark_superseded(self, document_id: int, version: int) -> int:
-        """Flag every older version of a document as superseded.
+    def correlatable_in_window(self, first: date, last: date) -> list[ManifestDocument]:
+        """Rows a re-filing may replace, or be, inside the retention window.
 
-        The listing drops a document's earlier versions once a re-filing lands,
-        so this is the only moment we learn the earlier one is no longer current.
-        The file is left untouched -- that history is the point of the archive.
+        `abandoned` is excluded: nobody follows that fund any more, so there is
+        nothing to keep tidy and no file to delete. Already-purged rows are
+        excluded because their file is gone for a different reason.
+        """
+        return [
+            ManifestDocument.from_row(r)
+            for r in self.connection.execute(
+                """
+                SELECT * FROM documents
+                 WHERE purged_at IS NULL
+                   AND local_state IN (?, ?, ?, ?, ?)
+                   AND delivery_date BETWEEN ? AND ?
+                 ORDER BY document_id, version
+                """,
+                (
+                    LocalState.DISCOVERED.value,
+                    LocalState.DOWNLOADING.value,
+                    LocalState.FAILED.value,
+                    LocalState.SKIPPED.value,
+                    LocalState.AVAILABLE.value,
+                    to_dir_name(first),
+                    to_dir_name(last),
+                ),
+            )
+        ]
+
+    def mark_superseded_by(
+        self, loser: tuple[int, int], winner: tuple[int, int]
+    ) -> int:
+        """Record that `winner` replaced `loser`. Does not touch the file.
+
+        Deleting the file is a separate step that runs only once the winner is
+        on disk, so this may safely run before anything has been downloaded.
         """
         cursor = self.connection.execute(
             """
             UPDATE documents
-               SET superseded_at = ?
-             WHERE document_id = ? AND version < ? AND superseded_at IS NULL
+               SET superseded_at = ?, superseded_by_id = ?, superseded_by_version = ?
+             WHERE document_id = ? AND version = ? AND superseded_at IS NULL
             """,
-            (timestamp(), document_id, version),
+            (timestamp(), winner[0], winner[1], loser[0], loser[1]),
+        )
+        return cursor.rowcount
+
+    def mark_superseded_removed(self, identities: Sequence[tuple[int, int]]) -> int:
+        """Consolidate rows whose file was deleted because a re-filing replaced it.
+
+        `purged_at` is deliberately left NULL: the row has not aged out, and
+        leaving it clear keeps `mark_purged` free to sweep it at the frontier
+        along with everything else from that day.
+        """
+        if not identities:
+            return 0
+        cursor = self.connection.executemany(
+            """
+            UPDATE documents
+               SET local_state = ?, path = NULL
+             WHERE document_id = ? AND version = ?
+            """,
+            [(LocalState.SUPERSEDED.value, doc_id, version) for doc_id, version in identities],
         )
         return cursor.rowcount
 
@@ -278,24 +341,29 @@ class ManifestRepo:
             )
         ]
 
-    def downloaded_since(self, since: str) -> list[ManifestDocument]:
-        """Documents whose local copy was written on or after `since`.
+    def downloaded_between(self, since: str, until: str) -> list[ManifestDocument]:
+        """Documents whose local copy was written in `[since, until)`.
 
         This is what the inbox index is built from: after an offline stretch the
         new arrivals are scattered across past delivery dates, so "what showed up
         today" cannot be answered by looking at today's directory.
+
+        `superseded` rows are returned alongside `available` ones so the index
+        for the day a document arrived can still say what replaced it, instead
+        of the entry silently disappearing when the index is regenerated.
         """
         return [
             ManifestDocument.from_row(r)
             for r in self.connection.execute(
                 """
                 SELECT * FROM documents
-                 WHERE local_state = ?
+                 WHERE local_state IN (?, ?)
                    AND purged_at IS NULL
                    AND downloaded_at >= ?
+                   AND downloaded_at < ?
                  ORDER BY delivery_date DESC, delivery_at DESC, document_id
                 """,
-                (LocalState.AVAILABLE.value, since),
+                (LocalState.AVAILABLE.value, LocalState.SUPERSEDED.value, since, until),
             )
         ]
 

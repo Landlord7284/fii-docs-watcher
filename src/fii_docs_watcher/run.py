@@ -11,7 +11,9 @@ Order matters:
     registry   once per run, as a snapshot rather than a per-scope lookup
     resolve    only scopes that need it
     discover   the whole retention window, per entity
+    supersede  detect, before fetching: never download what a re-filing replaced
     fetch      whatever is pending, including retries from earlier runs
+    supersede  sweep, after fetching: delete a replaced file once its winner landed
     inbox      after fetching, so it reflects what actually landed
     purge      last, so nothing is deleted before it has been indexed
     audit      last of all, and never able to fail the job
@@ -31,7 +33,7 @@ from .fnet.client import FnetClient
 from .lock import ProcessLock, ShutdownSignal
 from .manifest.db import connect
 from .manifest.repo import ManifestRepo
-from .pipeline import audit, discover, fetch, inbox, purge, reconcile
+from .pipeline import audit, discover, fetch, inbox, purge, reconcile, supersede
 from .scope.models import ExpansionState, Scope
 from .scope.resolver import resolve_scope
 from .scope.yaml_store import FundsFile
@@ -54,6 +56,7 @@ class RunReport:
     reconcile: reconcile.ReconcileReport | None = None
     discovery: discover.DiscoveryReport | None = None
     downloads: fetch.FetchReport | None = None
+    supersede: supersede.SupersedeReport | None = None
     inbox: inbox.InboxReport | None = None
     purge: purge.PurgeReport | None = None
     audit: audit.AuditReport | None = None
@@ -260,8 +263,23 @@ def execute(config: Config, *, skip_audit: bool = False, dry_run: bool = False) 
                     discover.check_watermarks(repo, window, monitored_ids)
                 )
 
+                # Before fetching: a document already replaced by a re-filing is
+                # dropped from the queue rather than downloaded and then deleted.
+                detected = supersede.detect(repo, window)
+
                 report.downloads = fetch.run(
                     client, repo, config, scopes, should_stop=lambda: shutdown.requested
+                )
+
+                # After fetching: the replacement is on disk now, if it was ever
+                # going to be, which is the condition for deleting what it replaced.
+                swept = supersede.sweep(repo, config, window)
+                report.supersede = supersede.SupersedeReport(
+                    detected=detected.detected,
+                    pending_cancelled=detected.pending_cancelled,
+                    files_removed=swept.files_removed,
+                    deferred=swept.deferred,
+                    errors=detected.errors + swept.errors,
                 )
 
                 # Confirmations earned during fetching belong in the YAML, so a

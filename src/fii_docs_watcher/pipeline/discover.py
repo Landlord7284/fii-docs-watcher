@@ -43,7 +43,6 @@ class DiscoveryReport:
     entities_failed: int = 0
     documents_seen: int = 0
     documents_new: int = 0
-    superseded: int = 0
     incomplete_scans: int = 0
     invalid_rows: int = 0
     errors: list[str] = field(default_factory=list)
@@ -91,10 +90,6 @@ def discover_entity(
                 row, fundosnet_id=entity.fundosnet_id, entity_cnpj=entity.normalized_cnpj
             ):
                 new_count += 1
-            if row.version > 1:
-                # The listing stops returning earlier versions once a re-filing
-                # lands, so this is the only chance to record that v1 is history.
-                report.superseded += repo.mark_superseded(row.document_id, row.version)
 
         if result.complete:
             repo.advance_watermark(entity.fundosnet_id, window.last)

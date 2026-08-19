@@ -80,6 +80,7 @@ def make_row(
     species: str = "",
     modality: str = "AP",
     status: str = "Ativo com visualização",
+    reference: str = "07/2026",
 ) -> dict:
     """One listing row, shaped exactly like the live responses.
 
@@ -96,7 +97,7 @@ def make_row(
         "tipoDocumento": doc_type,
         "especieDocumento": species,
         "dataEntrega": f"{delivery.strftime('%d/%m/%Y')} 09:30",
-        "dataReferencia": "07/2026",
+        "dataReferencia": reference,
         "formatoDataReferencia": "2",
         "descricaoModalidade": "Apresentação",
         "modalidade": modality,

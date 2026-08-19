@@ -62,10 +62,16 @@ CREATE TABLE IF NOT EXISTS documents (
 
     downloaded_at         TEXT,
     purged_at             TEXT,
-    -- Set when a higher version of the same document_id is observed. The file
-    -- stays on disk: a superseded version is history worth keeping, and the
-    -- listing stops returning it once the re-filing lands.
+    -- Set when a re-filing of this publication is observed, either as a higher
+    -- version of the same document_id or as a separate document that carries
+    -- the same category, type, species and reference date for the same entity.
+    -- The archive is a reading queue, so only the live version is kept: once
+    -- the replacement is safely on disk the older file is deleted and the row
+    -- moves to local_state 'superseded'. The row itself is never deleted, so
+    -- "what was published, and what replaced it" stays answerable.
     superseded_at         TEXT,
+    superseded_by_id      INTEGER,
+    superseded_by_version INTEGER,
     seen_at               TEXT NOT NULL,
 
     PRIMARY KEY (document_id, version)

@@ -67,6 +67,23 @@ Consequences worth knowing:
 - A CNPJ is indexed to **every** registry row that carries it, not the first: rows are merged so class expansion and candidate types come from all of its registrations.
 - Downgrading is not safe. An older build ignores `fnet_fund_type`, falls back to 1, and silently finds nothing for a FIAGRO entity.
 
+## Only the live version is kept
+
+**Stated deviation from §1 and §2.4**, which place the correlation of a document with its re-filing *under a different id* outside Pipeline A, and from the original manifest contract that a superseded file stays on disk as history. The archive is a reading queue for people: a corrected copy sitting next to the original is precisely the noise the inbox index exists to remove.
+
+`pipeline/supersede.py` applies two rules, both of them, over the retention window:
+
+- **R1** — same `document_id`, strictly higher `version`. Spec-conformant. Kept as its own rule because a re-filing may correct the *reference date*, which would move it out of R2's group.
+- **R2** — same entity, `category`, `doc_type`, `species` and `reference_date`; strictly higher `version`. This is the deviation, and the rule that catches the observed shape: `HGBS11_Relatorios_1295651_V01.pdf` replaced by `HGBS11_Relatorios_1295810_V02.pdf` — a *new id* carrying `versao: 2`.
+
+**R2's safety is the strictly-higher-version requirement, not the key.** Two genuinely distinct documents from one fund on one day — two Fatos Relevantes — both arrive as `V01` and therefore never correlate. A group only yields a supersession when the source itself bumped the version, which is the re-filing signature. R2 also requires a non-empty `reference_date`, its strongest discriminator; without one the key is barely more than a category, so the rule stands down and R1 still covers the same-id case. `correlate()` is pure and is where these rules are pinned (`tests/unit/test_supersede.py`).
+
+**The work is split across `fetch` on purpose.** `detect` runs *before* fetching and cancels a loser that was never downloaded, so the run does not fetch a file it is about to delete. `sweep` runs *after*, and deletes a loser's file **only once its winner is `available`** — a replacement that failed to download leaves the original in place, because one readable copy beats none.
+
+`local_state` gains `superseded`, distinct from `purged`: `purged` has to keep meaning "aged past the retention frontier" and nothing else, or the archive can no longer explain why a file is gone. The row is never deleted, and `superseded_by_id`/`superseded_by_version` (manifest schema version 2) record what replaced it.
+
+The inbox index follows: the body lists live versions only, and a trailing `## Superseded versions` section names the replaced ones without links, since their files are gone. **Every in-window index is regenerated each run**, not just today's — a document downloaded on Monday can be superseded on Wednesday, and Monday's index would otherwise keep a link to a deleted file. A past day's index is only *rewritten*, never invented: a first run must not fabricate indexes for days the robot was not there for.
+
 ## The spec is the authority
 
 `arquitetura-fii-monitor-pipeline-a-rev3.md` is the source of truth. It defines *what* and *why*, never *how*.
@@ -97,6 +114,7 @@ The spec names things in Portuguese. Translate them; do not transliterate. This 
 | `id_documento` / `versao` / `id_fundosnet` | `document_id` / `version` / `fundosnet_id` |
 | `data_entrega` / `data_referencia` / `formato_data_referencia` | `delivery_date` / `reference_date` / `reference_date_format` |
 | `estado_local` / `hash_conteudo` / `data_purga` / `visto_em` | `local_state` / `content_hash` / `purged_at` / `seen_at` |
+| `substituido` (state beyond the spec's five) | `superseded` |
 | `denominacao_social` / `codigo_cvm` / `situacao_cvm` | `legal_name` / `cvm_code` / `cvm_status` |
 | `expansao: parcial` | `expansion: partial` |
 | `{prefixo_entidade}` in filenames | `{entity_prefix}` |
@@ -165,7 +183,7 @@ Measured against the live source; encoded in the code and pinned by `tests/contr
 
 **§9.3 — `listarFundos` does expose classes**, each with its own id (`URBANITY CORPORATE` → fund 25256, `CLASSE A` 25257, `CLASSE B` 25258). Two further behaviours the spec does not mention: it pages at **20 results** with a `more` flag, and **the same name can map to several ids** (`CLASSE A DE COTAS DO VBI ULIVING MULTICLASSE` → 1054 *and* 20524), so a candidate is never chosen on a name match alone.
 
-**§9.1 — the listing keeps only the live version.** A document re-filed as v2 returns v2 only; v1 disappears. The v1 file stays on disk and is marked `superseded_at` in the manifest — that history is the point of the archive.
+**§9.1 — the listing keeps only the live version.** A document re-filed as v2 returns v2 only; v1 disappears. The v1 file is deleted and its row moves to `superseded` — see "Only the live version is kept" above.
 
 **§9.4 — `Content-Disposition` format confirmed** as `{cnpj14}-{SIGLA}{ddMMyyyy}V{NN}-{id9}.{ext}`. For a monoclass fund the CNPJ is the fund's, confirming §2.7's mitigating factor. The fund-vs-class question for a genuinely multiclass fund remains untested; §3.3's rule (compare against the **queried entity's** CNPJ) already handles either answer.
 
@@ -186,4 +204,4 @@ Wire-schema facts worth not re-deriving: `fundoOuClasse` is now overwhelmingly `
 - Parsing document contents — that is Pipeline B.
 - Long-term preservation. This is a sliding N-day window, not an archive.
 - **B3 trading ticker resolution — a closed decision.** No native source exists in CVM or Fundos.NET data (verified across the FCA, the Open Data Portal monthly-report CSVs, and the structured monthly report XML, which carries only `CodigoISIN`). Do not introduce an external dependency for it.
-- Correlating a document with its later re-filing when they arrive under different ids — "logical correlation", as distinct from publication identity (§1, §2.4). Note the spec's own cross-reference to "6.1" here is dangling; section 6 has no subsections.
+- Correlating a document with its later re-filing when they arrive under different ids — "logical correlation", as distinct from publication identity (§1, §2.4). **No longer true** — see "Only the live version is kept" above; the spec's own cross-reference to "6.1" here is dangling anyway, since section 6 has no subsections.

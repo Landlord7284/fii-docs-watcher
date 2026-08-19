@@ -21,7 +21,7 @@ from fii_docs_watcher.config import Config
 from fii_docs_watcher.fnet.client import FnetClient
 from fii_docs_watcher.manifest.db import connect
 from fii_docs_watcher.manifest.repo import LocalState, ManifestRepo
-from fii_docs_watcher.pipeline import discover, fetch, inbox, purge, reconcile
+from fii_docs_watcher.pipeline import discover, fetch, inbox, purge, reconcile, supersede
 from fii_docs_watcher.run import prepare_roots
 from fii_docs_watcher.scope.yaml_store import FundsFile
 
@@ -48,7 +48,9 @@ def env(config: Config, fake_fnet: FakeFnet):
 def _cycle(config, repo, scopes, client, window):
     """Discovery + fetch, the two stages that move documents onto disk."""
     d = discover.run(client, repo, scopes, window, page_length=config.source.page_length)
+    supersede.detect(repo, window)
     f = fetch.run(client, repo, config, scopes)
+    supersede.sweep(repo, config, window)
     return d, f
 
 
@@ -123,17 +125,19 @@ class TestDiscoveryAndDownload:
         fake.disposition[1001] = (
             'attachment; filename="08431747000106-IFP14082026V02-000001001.pdf"'
         )
-        d, f = _cycle(config, repo, scopes, client, window)
+        _, f = _cycle(config, repo, scopes, client, window)
 
-        assert d.superseded == 1
         assert f.downloaded == 1
         v1, v2 = repo.get(1001, 1), repo.get(1001, 2)
         assert v1 is not None and v2 is not None
         assert v1.superseded_at is not None
-        # v1's file survives: that history is exactly what the archive is for.
-        assert (config.paths.documents_root / v1.path).is_file()
+        assert v1.superseded_by == (1001, 2)
+        # Only the live version is kept: the reader wants the correction, not a
+        # catalogue of what it corrected. The row survives, the file does not.
+        assert v1.local_state == LocalState.SUPERSEDED
+        assert v1.path is None
         assert (config.paths.documents_root / v2.path).is_file()
-        assert v1.path != v2.path
+        assert not any(config.paths.documents_root.rglob("*_V01.pdf"))
 
     def test_the_stable_sort_is_sent_on_every_listing_request(self, env) -> None:
         config, fake, repo, scopes, client = env
@@ -841,6 +845,199 @@ class TestInbox:
         report = inbox.run(repo, config, retention_window(7))
         text = (config.paths.documents_root / report.path).read_text(encoding="utf-8")
         assert "Nothing new arrived today" in text
+
+
+def _pdf(fake, document_id: int, version: int) -> None:
+    """Serve `document_id` as a PDF, the way the archive's reading queue gets them."""
+    fake.payloads[document_id] = SAMPLE_PDF
+    fake.content_type[document_id] = "application/pdf"
+    fake.disposition[document_id] = (
+        f'attachment; filename="08431747000106-RGE18082026V{version:02d}-'
+        f'{document_id:09d}.pdf"'
+    )
+
+
+class TestSupersession:
+    """A re-filing published under a *new* id, which is the common shape.
+
+    Stated deviation: the spec puts this correlation outside Pipeline A. The
+    archive is a reading queue, so only the live version is kept.
+    """
+
+    def test_a_refiling_under_a_new_id_replaces_the_original_on_disk(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        window = retention_window(config.retention.days)
+        fake.add_documents(FUND_ID, [make_row(1295651, category="Relatórios")])
+        _pdf(fake, 1295651, 1)
+        _cycle(config, repo, scopes, client, window)
+        assert repo.get(1295651, 1).local_state == LocalState.AVAILABLE
+
+        # The correction arrives as a separate document carrying versao 2.
+        fake.documents[FUND_ID].append(
+            make_row(1295810, version=2, category="Relatórios", modality="RE")
+        )
+        _pdf(fake, 1295810, 2)
+        _cycle(config, repo, scopes, client, window)
+
+        old, new = repo.get(1295651, 1), repo.get(1295810, 2)
+        assert old.superseded_by == (1295810, 2)
+        assert old.local_state == LocalState.SUPERSEDED
+        assert old.path is None
+        assert new.local_state == LocalState.AVAILABLE
+        names = {p.name for p in config.paths.documents_root.rglob("*.pdf")}
+        assert names == {"HGBS11_Relatorios_1295810_V02.pdf"}
+
+    def test_a_replacement_that_never_lands_leaves_the_original_alone(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        window = retention_window(config.retention.days)
+        fake.add_documents(FUND_ID, [make_row(1295651, category="Relatórios")])
+        _pdf(fake, 1295651, 1)
+        _cycle(config, repo, scopes, client, window)
+
+        fake.documents[FUND_ID].append(
+            make_row(1295810, version=2, category="Relatórios", modality="RE")
+        )
+        fake.fail_downloads.add(1295810)
+        _cycle(config, repo, scopes, client, window)
+
+        old = repo.get(1295651, 1)
+        # One readable copy beats none: the deletion waits for the replacement.
+        assert old.superseded_at is not None
+        assert old.local_state == LocalState.AVAILABLE
+        assert (config.paths.documents_root / old.path).is_file()
+
+    def test_a_replaced_document_is_never_downloaded_in_the_first_place(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        window = retention_window(config.retention.days)
+        # Both versions show up in the same discovery pass, before any fetch.
+        fake.add_documents(
+            FUND_ID,
+            [
+                make_row(1295651, category="Relatórios"),
+                make_row(1295810, version=2, category="Relatórios", modality="RE"),
+            ],
+        )
+        _pdf(fake, 1295651, 1)
+        _pdf(fake, 1295810, 2)
+        _cycle(config, repo, scopes, client, window)
+
+        assert repo.get(1295651, 1).local_state == LocalState.SUPERSEDED
+        # Not merely deleted afterwards: the request is never made at all.
+        downloads = [r for r in fake.request_log if r.startswith("downloadDocumento")]
+        assert not any("id=1295651" in r for r in downloads)
+        assert any("id=1295810" in r for r in downloads)
+
+    def test_two_documents_at_version_one_both_survive(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        window = retention_window(config.retention.days)
+        # Same fund, same day, same category and reference date -- but neither
+        # is a re-filing of the other, and the version is what proves it.
+        fake.add_documents(
+            FUND_ID,
+            [
+                make_row(1295651, category="Fato Relevante"),
+                make_row(1295810, category="Fato Relevante"),
+            ],
+        )
+        _pdf(fake, 1295651, 1)
+        _pdf(fake, 1295810, 1)
+        _cycle(config, repo, scopes, client, window)
+
+        assert len(list(config.paths.documents_root.rglob("*.pdf"))) == 2
+
+
+class TestInboxAndSupersession:
+    def test_the_index_body_keeps_the_live_version_and_explains_the_other(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        window = retention_window(config.retention.days)
+        fake.add_documents(FUND_ID, [make_row(1295651, category="Relatórios")])
+        _pdf(fake, 1295651, 1)
+        _cycle(config, repo, scopes, client, window)
+        fake.documents[FUND_ID].append(
+            make_row(1295810, version=2, category="Relatórios", modality="RE")
+        )
+        _pdf(fake, 1295810, 2)
+        _cycle(config, repo, scopes, client, window)
+
+        report = inbox.run(repo, config, window)
+        assert report.documents == 1
+        assert report.superseded == 1
+
+        text = (config.paths.documents_root / report.path).read_text(encoding="utf-8")
+        body, _, tail = text.partition("## Superseded versions")
+        # Exactly one thing to open, and it is the correction.
+        assert body.count("](../") == 1
+        assert "1295810_V02.pdf" in body
+        assert "1295651" not in body
+        # The replaced one is named, at the end, with no link to a missing file.
+        assert "replaced by 1295810 v2" in tail
+        assert "](../" not in tail
+
+    def test_a_past_index_is_rewritten_when_its_document_is_replaced(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        window = retention_window(config.retention.days)
+        fake.add_documents(FUND_ID, [make_row(1295651, category="Relatórios")])
+        _pdf(fake, 1295651, 1)
+        _cycle(config, repo, scopes, client, window)
+        inbox.run(repo, config, window)
+
+        # Backdate the download so it belongs to yesterday's index, then write
+        # that index: this is the "downloaded Monday, superseded Wednesday" case.
+        yesterday_dir = to_dir_name(today() - timedelta(days=1))
+        repo.connection.execute(
+            "UPDATE documents SET downloaded_at = ? WHERE document_id = 1295651",
+            (f"{yesterday_dir}T10:00:00-03:00",),
+        )
+        stale = inbox.run(repo, config, window)
+        assert stale.documents == 0
+        past = config.paths.inbox_dir / f"{yesterday_dir}.md"
+        past.write_text(
+            inbox.render(
+                repo.downloaded_between(f"{yesterday_dir}T00:00:00", f"{yesterday_dir}T23:59:59"),
+                for_date=today() - timedelta(days=1),
+                window=window,
+            ),
+            encoding="utf-8",
+        )
+        assert "](../" in past.read_text(encoding="utf-8")
+
+        fake.documents[FUND_ID].append(
+            make_row(1295810, version=2, category="Relatórios", modality="RE")
+        )
+        _pdf(fake, 1295810, 2)
+        _cycle(config, repo, scopes, client, window)
+        # Today's index and yesterday's, which is the point: the past one is
+        # rewritten because it now points at a file that no longer exists.
+        assert inbox.run(repo, config, window).files_written == 2
+
+        rewritten = past.read_text(encoding="utf-8")
+        # The link to the deleted file is gone, and the entry is explained
+        # rather than silently dropped from the day it arrived on.
+        assert "](../" not in rewritten
+        assert "replaced by 1295810 v2" in rewritten
+
+    def test_a_day_with_no_index_never_gets_one_invented(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        window = retention_window(config.retention.days)
+        report = inbox.run(repo, config, window)
+
+        assert report.files_written == 1
+        written = {p.name for p in config.paths.inbox_dir.glob("*.md")}
+        assert written == {f"{to_dir_name(today())}.md"}
 
 
 class TestFailureIsolation:

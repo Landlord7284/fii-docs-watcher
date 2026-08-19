@@ -126,8 +126,9 @@ def build_parser() -> argparse.ArgumentParser:
             "needs; everything else is for setting up and inspecting.\n\n"
             "In order: reconcile anything a previous run left half-done, refresh the CVM\n"
             "registry snapshot, resolve any scope that needs it, query the whole retention\n"
-            "window per entity, download what is new, write the inbox index, purge past the\n"
-            "frontier, then run the global audit.\n\n"
+            "window per entity, download what is new, delete any version a re-filing has\n"
+            "replaced, write the inbox index, purge past the frontier, then run the global\n"
+            "audit.\n\n"
             "Safe to run as often as you like: rediscovering a document updates its status\n"
             "and never downloads it again."
         ),
@@ -668,32 +669,10 @@ def cmd_rm(config: Config, args: argparse.Namespace) -> int:
 
 def _delete_documents(config: Config, repo: ManifestRepo, documents: list) -> int:
     """Delete archived files for a removed fund, then mark their rows purged."""
-    removed: list[tuple[int, int]] = []
-    touched_dirs: set[Path] = set()
-    for document in documents:
-        if not document.path:
-            continue
-        path = config.paths.documents_root / document.path
-        try:
-            path.unlink(missing_ok=True)
-            touched_dirs.add(path.parent)
-            removed.append((document.document_id, document.version))
-        except OSError as exc:
-            log.error(
-                "could not delete an archived file",
-                extra={"path": str(path), "error": str(exc)},
-            )
+    from .pipeline import purge
 
+    removed = purge.remove_files(config, documents)
     repo.mark_documents_purged(removed)
-
-    # Leave no empty date directories behind, so the archive keeps reading as
-    # "these are the days that have something in them".
-    for directory in touched_dirs:
-        try:
-            if directory.is_dir() and not any(directory.iterdir()):
-                directory.rmdir()
-        except OSError:  # pragma: no cover - a racing writer is fine to ignore
-            pass
     return len(removed)
 
 
@@ -910,7 +889,18 @@ def _print_summary(report: RunReport) -> None:
         d = report.discovery
         print(
             f"discovery         entities={d.entities_scanned} failed={d.entities_failed} "
-            f"seen={d.documents_seen} new={d.documents_new} superseded={d.superseded}"
+            f"seen={d.documents_seen} new={d.documents_new}"
+        )
+    if report.supersede and (
+        report.supersede.detected
+        or report.supersede.files_removed
+        or report.supersede.deferred
+    ):
+        sp = report.supersede
+        extras = f"  deferred={sp.deferred}" if sp.deferred else ""
+        print(
+            f"superseded        detected={sp.detected} files_removed={sp.files_removed} "
+            f"cancelled={sp.pending_cancelled}{extras}"
         )
     if report.downloads:
         f = report.downloads
@@ -924,7 +914,9 @@ def _print_summary(report: RunReport) -> None:
             f"bytes={f.bytes_written:,}{extras}"
         )
     if report.inbox:
-        print(f"inbox             {report.inbox.path} ({report.inbox.documents} document(s))")
+        i = report.inbox
+        extras = f", {i.superseded} superseded" if i.superseded else ""
+        print(f"inbox             {i.path} ({i.documents} document(s){extras})")
     if report.purge:
         p = report.purge
         print(

@@ -169,7 +169,8 @@ Runs the pipeline once and exits. **This is the only command a scheduler needs.*
 
 In order: reconcile whatever a previous run left half-done → refresh the CVM registry snapshot →
 resolve any scope that needs it → query the whole retention window per entity → download what is
-new → write the inbox index → purge past the frontier → run the global audit.
+new → delete any version a re-filing has replaced → write the inbox index → purge past the frontier
+→ run the global audit.
 
 ```bash
 fii-docs-watcher run
@@ -351,6 +352,10 @@ filed.
 Filenames are `{prefix}_{category}_{id}_V{version}.{ext}`. The version is part of the name because a
 re-filing can reuse the document id, and without it v2 would overwrite v1. The extension is decided
 by the file's actual content, never by what the server claimed.
+
+When a fund re-files a document, only the corrected version is kept: the older file is deleted once
+the replacement is safely on disk, and the index lists it under **Superseded versions** at the end
+so an entry never disappears without an explanation. The manifest keeps the record either way.
 
 `data_root` holds `funds.yaml` (yours to edit, and the robot writes resolved data back into it),
 `manifest.sqlite`, `watcher.lock` and the CVM cache. It is never meant to be shared.

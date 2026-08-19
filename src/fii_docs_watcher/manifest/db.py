@@ -19,7 +19,7 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 _SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
 
@@ -58,6 +58,14 @@ def _migrate(connection: sqlite3.Connection) -> None:
 
     # Future migrations chain from here, each guarded by the version it upgrades
     # from, so a database can be brought forward across several releases at once.
+
+    if 0 < current < 2:
+        # Version 2 records which publication replaced a superseded one, so the
+        # inbox index can name the replacement without re-deriving the match.
+        # A database created from scratch already has these from schema.sql.
+        connection.execute("ALTER TABLE documents ADD COLUMN superseded_by_id INTEGER")
+        connection.execute("ALTER TABLE documents ADD COLUMN superseded_by_version INTEGER")
+        log.info("manifest schema migrated", extra={"from": current, "to": 2})
 
     connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 

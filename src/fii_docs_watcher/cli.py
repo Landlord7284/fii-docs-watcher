@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+import shutil
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 from . import __version__
@@ -470,6 +472,144 @@ def _choose_by_name(config: Config, term: str) -> str | None:
     return chosen.cnpj
 
 
+@dataclass(frozen=True)
+class _Column:
+    """One column of the `list` table.
+
+    `caption` marks a column that describes a fund rather than identifying it:
+    when every listed row agrees on its value, it is printed once above the
+    table under that caption instead of repeated on every line. The caption has
+    room for words the column header cannot fit.
+    """
+
+    key: str
+    title: str
+    caption: str = ""
+    align_right: bool = False
+    elastic: bool = False
+
+    @property
+    def hoistable(self) -> bool:
+        return bool(self.caption)
+
+
+_LIST_COLUMNS = (
+    _Column("ticker", "TICKER"),
+    _Column("state", "ST", caption="state"),
+    _Column("cnpj", "CNPJ"),
+    _Column("confirmed", "CONFIRMED", caption="cnpj confirmed by a download"),
+    _Column("fnet_id", "FNET ID", align_right=True),
+    _Column("fnet_type", "TYPE", caption="fnet fund type", align_right=True),
+    _Column("cvm", "CVM", align_right=True),
+    _Column("cvm_status", "CVM STATUS", caption="cvm status"),
+    _Column("mode", "MODE", caption="mode"),
+    _Column("expansion", "EXPANSION", caption="expansion"),
+    _Column("name", "NAME", elastic=True),
+)
+
+# Below this a name column stops being worth reading, so a narrow terminal gets
+# a line that overflows rather than a column of ellipses.
+_MIN_ELASTIC_WIDTH = 24
+
+
+def _terminal_width() -> int:
+    """Usable width, with a sane answer when the output is a pipe or a file."""
+    return max(60, shutil.get_terminal_size(fallback=(100, 24)).columns)
+
+
+def _shorten(value: str, width: int) -> str:
+    return value if len(value) <= width else value[: max(1, width - 1)] + "\u2026"
+
+
+def _list_rows(scopes: list[Scope]) -> list[dict[str, str]]:
+    """One row per entity, with the fund's own cells blank after the first.
+
+    A multiclass scope is still one fund to the reader, so repeating its name,
+    mode and CVM registration on every class row would bury the ids and CNPJs
+    that are the only things differing between them. An unresolved scope has no
+    entity yet and contributes a single row.
+    """
+    rows: list[dict[str, str]] = []
+    for scope in scopes:
+        fund = {
+            "ticker": scope.ticker or "-",
+            "state": "ok" if scope.resolved else "UNRESOLVED",
+            # Blank, not a dash: an unknown cell says nothing, and `_hoist_common`
+            # reads it as "no opinion" rather than as a value the rows disagree on.
+            "cvm": scope.cvm_code or "",
+            "cvm_status": scope.cvm_status or "",
+            "mode": scope.mode.value,
+            "expansion": scope.expansion.value,
+            "name": scope.legal_name or "",
+        }
+        if not scope.entities:
+            rows.append({**fund, "cnpj": format_masked(scope.cnpj) or scope.cnpj})
+            continue
+        for position, entity in enumerate(scope.entities):
+            entity_cells = {
+                "cnpj": format_masked(entity.cnpj) or entity.cnpj,
+                # Whether a downloaded file has proved this entity's CNPJ, not
+                # how the fund was registered -- see `fetch._check_cnpj`.
+                "confirmed": "yes" if entity.cnpj_confirmed else "not yet",
+                "fnet_id": str(entity.fundosnet_id),
+                "fnet_type": str(entity.fnet_fund_type),
+            }
+            if position == 0:
+                name = fund["name"] or entity.fnet_fund_description
+                rows.append({**fund, **entity_cells, "name": name})
+            else:
+                rows.append({**entity_cells, "name": entity.fnet_fund_description})
+    return rows
+
+
+def _hoist_common(
+    rows: list[dict[str, str]], columns: tuple[_Column, ...]
+) -> tuple[dict[str, str], list[_Column]]:
+    """Split the columns into what every row agrees on and what still varies.
+
+    Blank cells are continuation rows of a fund already described above, not
+    disagreement, so they are ignored; a column nobody filled in at all is
+    dropped entirely rather than hoisted as an empty fact.
+    """
+    common: dict[str, str] = {}
+    kept: list[_Column] = []
+    for column in columns:
+        values = {row.get(column.key, "") for row in rows}
+        values.discard("")
+        if not values:
+            continue
+        if column.hoistable and len(values) == 1:
+            common[column.caption] = values.pop()
+        else:
+            kept.append(column)
+    return common, kept
+
+
+def _render_table(rows: list[dict[str, str]], columns: list[_Column], width: int) -> list[str]:
+    widths = {
+        column.key: max(len(column.title), *(len(row.get(column.key, "")) for row in rows))
+        for column in columns
+    }
+    elastic = [column for column in columns if column.elastic]
+    if elastic:
+        gutters = 2 * (len(columns) - 1)
+        fixed = sum(w for key, w in widths.items() if key not in {c.key for c in elastic})
+        share = (width - fixed - gutters) // len(elastic)
+        for column in elastic:
+            widths[column.key] = max(_MIN_ELASTIC_WIDTH, min(widths[column.key], share))
+
+    def line(cells: dict[str, str]) -> str:
+        parts = []
+        for column in columns:
+            text = _shorten(cells.get(column.key, ""), widths[column.key])
+            size = widths[column.key]
+            parts.append(text.rjust(size) if column.align_right else text.ljust(size))
+        return "  ".join(parts).rstrip()
+
+    rule = "  ".join("-" * widths[column.key] for column in columns)
+    return [line({column.key: column.title for column in columns}), rule, *(line(r) for r in rows)]
+
+
 def cmd_list(config: Config, args: argparse.Namespace) -> int:
     funds_file = FundsFile.load(config.paths.funds_file)
     all_scopes = funds_file.scopes()
@@ -483,20 +623,20 @@ def cmd_list(config: Config, args: argparse.Namespace) -> int:
         print(f"No registered fund matches {query!r}. {len(all_scopes)} registered in total.")
         return ExitCode.OK
 
-    for scope in scopes:
-        marker = "ok" if scope.resolved else "UNRESOLVED"
-        print(f"\n{scope.label}  [{marker}]  {format_masked(scope.cnpj)}")
-        if scope.legal_name:
-            print(f"  {scope.legal_name}")
-        print(f"  mode={scope.mode.value}  expansion={scope.expansion.value}", end="")
-        print(f"  cvm={scope.cvm_code or '-'}  status={scope.cvm_status or '-'}")
-        for entity in scope.entities:
-            confirmed = "confirmed" if entity.cnpj_confirmed else "unconfirmed"
-            print(
-                f"    - id={entity.fundosnet_id:<8} type={entity.fnet_fund_type:<3} "
-                f"{format_masked(entity.cnpj)}  "
-                f"[{confirmed}]  {entity.fnet_fund_description[:48]}"
-            )
+    rows = _list_rows(scopes)
+    common, columns = _hoist_common(rows, _LIST_COLUMNS)
+    entities = sum(len(scope.entities) for scope in scopes)
+    print(f"\n{len(scopes)} fund(s), {entities} entity(ies)")
+
+    if common:
+        caption_width = max(len(caption) for caption in common)
+        print("\ncommon to all")
+        for caption, value in common.items():
+            print(f"  {caption.ljust(caption_width)}  {value}")
+
+    print()
+    for text in _render_table(rows, columns, _terminal_width()):
+        print(text)
     print()
     if query:
         print(f"showing {len(scopes)} of {len(all_scopes)} registered fund(s)\n")

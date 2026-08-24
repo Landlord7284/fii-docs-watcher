@@ -223,6 +223,14 @@ fii-docs-watcher list 08756747
 The search covers ticker, legal name, Fundos.NET description and CNPJ digits, ignoring accents,
 case and punctuation.
 
+The output is a table, with anything every listed fund agrees on printed once above it rather than
+on every row. A fund with several classes gets one row per class.
+
+`CONFIRMED` says whether a downloaded file has already proved that entity's CNPJ, and reads
+`not yet` until the first document arrives -- for every fund, however it was registered. Fundos.NET
+never returns a CNPJ in a listing, so the link between a CNPJ and a Fundos.NET id stays an inference
+until a download's `Content-Disposition` confirms it.
+
 ### `rm QUERY`
 
 Stops following a fund and removes it from the watch list.

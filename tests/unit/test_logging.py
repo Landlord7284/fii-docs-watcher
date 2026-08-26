@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
+import time
+from datetime import UTC, datetime
 
 import pytest
 
@@ -70,3 +71,33 @@ class TestTimestampsFollowTheSource:
         formatter = _TextFormatter()
         set_timezone("UTC")
         assert "+0000" in formatter.format(_record())
+
+    def test_a_hostile_host_zone_does_not_reach_the_stamp(
+        self, hostile_host_timezone: str
+    ) -> None:
+        # The tests above never set `TZ`, so they would pass even if
+        # `formatTime` fell back to libc `localtime`. This one arms that trap:
+        # the host says +0900 while the source says -0300, and a leak shows up
+        # as the wrong offset on every line.
+        set_timezone("America/Sao_Paulo")
+        record = _record()
+
+        assert "-0300" in _TextFormatter().format(record)
+        assert json.loads(_JsonFormatter().format(record))["ts"].endswith("-0300")
+        # Vacuity guard: without this the host may simply have been -0300 too.
+        assert time.localtime().tm_gmtoff == 9 * 3600
+
+    def test_a_hostile_host_zone_does_not_shift_the_date(
+        self, hostile_host_timezone: str
+    ) -> None:
+        # The failure this whole arrangement exists to prevent: an event logged
+        # under one date while the document it describes is filed under another.
+        set_timezone("America/Sao_Paulo")
+        record = _record()
+        record.created = datetime(
+            2026, 8, 15, 1, 30, tzinfo=UTC
+        ).timestamp()
+
+        stamp = _TextFormatter().format(record)
+        assert "2026-08-14" in stamp  # 22:30 in Sao Paulo
+        assert "2026-08-15" not in stamp  # 10:30 in Tokyo, the wrong day

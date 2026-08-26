@@ -1,7 +1,7 @@
 # fii-docs-watcher configuration.
 #
-# Every value here can be overridden by an environment variable named
-# FII_WATCHER_<SECTION>_<KEY>, e.g. FII_WATCHER_PATHS_DATA_ROOT.
+# Every value here except [source].timezone can be overridden by an environment
+# variable named FII_WATCHER_<SECTION>_<KEY>, e.g. FII_WATCHER_PATHS_DATA_ROOT.
 # No path, CNPJ or personal preference is ever compiled into the code.
 
 [paths]
@@ -35,6 +35,10 @@ base_url = "https://fnet.bmfbovespa.com.br/fnet/publico"
 # while leaving what is already on disk under the old dates, so treat it as a
 # deployment-wide constant, not a knob. Any IANA name available on the host is
 # accepted; an unrecognised one refuses to start rather than falling back.
+#
+# This is the one key with no environment override: it is the project's single
+# declaration of a zone, and setting FII_WATCHER_SOURCE_TIMEZONE is an error
+# rather than a second place to name it.
 timezone = "America/Sao_Paulo"
 
 # Identifiable, as courtesy to a public endpoint we do not own.

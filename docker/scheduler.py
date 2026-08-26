@@ -10,7 +10,11 @@ would, which also means a crash inside a run cannot take the loop down with it.
 It reads the configuration only to learn the timezone. Schedules are evaluated
 in `clock.source_tz()` -- the same zone the archive is dated by -- so "08:00"
 means the same instant here as it does in a directory name, whatever the
-container's own idea of local time.
+container's own idea of local time. Nothing here consults `TZ`, and nothing
+should: `[source].timezone` is the only place the project declares a zone.
+`tests/unit/test_scheduler.py` pins that by running the match under a `TZ` set
+twelve hours away, so reintroducing the coupling fails a test rather than
+quietly shifting when every run fires.
 
 Matching is done by waking at the top of every minute and asking whether the
 current minute satisfies the expression. That is a great deal simpler than

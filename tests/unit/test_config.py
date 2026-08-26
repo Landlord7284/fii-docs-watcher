@@ -211,10 +211,27 @@ class TestTimezone:
         # The point of the key: the clock has to actually follow it.
         assert str(source_tz()) == "UTC"
 
-    def test_the_environment_can_override_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_the_environment_cannot_override_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The config file is the project's single declaration of a zone. A
+        # `.env` only exists under compose and is invisible to a native
+        # install, so a second declaration there would let two deployments of
+        # one archive file the same document under different dates.
         monkeypatch.setenv("FII_WATCHER_SOURCE_TIMEZONE", "Europe/Lisbon")
-        assert load().source.timezone == "Europe/Lisbon"
-        assert str(source_tz()) == "Europe/Lisbon"
+        with pytest.raises(ConfigError, match="cannot be overridden from the environment"):
+            load()
+
+    def test_the_refusal_is_an_error_rather_than_a_silent_ignore(
+        self, monkeypatch: pytest.MonkeyPatch, isolated: Path
+    ) -> None:
+        # A value with no effect is worse than an error: the operator would
+        # read Lisbon and get Sao Paulo, with nothing to say why.
+        (isolated / "config.toml").write_text('[source]\ntimezone = "UTC"\n')
+        monkeypatch.setenv("FII_WATCHER_SOURCE_TIMEZONE", "Europe/Lisbon")
+        with pytest.raises(ConfigError) as excinfo:
+            load()
+        # The message has to name the alternative, or the refusal is a dead end.
+        assert "config file" in str(excinfo.value)
+        assert str(source_tz()) == DEFAULT_TIMEZONE
 
     def test_an_unknown_zone_is_a_config_error(self, isolated: Path) -> None:
         (isolated / "config.toml").write_text('[source]\ntimezone = "Mars/Olympus"\n')

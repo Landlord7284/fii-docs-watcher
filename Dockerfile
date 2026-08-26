@@ -3,6 +3,11 @@
 # and sqlite3, expat and zlib are already in the slim image. So there is no
 # apt-get here at all -- if one appears, something has been added that the
 # project did not need.
+#
+# That includes the IANA timezone database, which this image does not ship: it
+# comes from the `tzdata` wheel pinned in pyproject.toml, not from a system
+# package. Dropping that dependency breaks the container at zone resolution,
+# which happens at import and so crashes before any error handling runs.
 
 FROM python:3.13-slim AS builder
 

@@ -8,6 +8,7 @@ logic and the real state machine without touching the network.
 from __future__ import annotations
 
 import json
+import time
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -67,6 +68,33 @@ def config(tmp_path: Path) -> Config:
         files=FilesConfig(),
         logging=LoggingConfig(level="DEBUG"),
     )
+
+
+# The host timezone this project must stay independent of. Twelve hours from
+# America/Sao_Paulo, so an hour matched in the wrong zone lands on a different
+# day, not merely a different hour.
+HOSTILE_TZ = "Asia/Tokyo"
+
+
+@pytest.fixture
+def hostile_host_timezone(monkeypatch: pytest.MonkeyPatch):
+    """Set the host's `TZ` to a zone far from the source's, and arm it.
+
+    `TZ` alone proves nothing: `datetime.now(tz)` ignores it entirely, and libc
+    keeps its cached zone until `tzset()` runs. A test that only sets the
+    variable therefore passes whether or not the code under test consults the
+    host clock. The `tzset()` call is what makes the trap real, and is why this
+    fixture exists instead of a bare `monkeypatch.setenv`.
+    """
+    monkeypatch.setenv("TZ", HOSTILE_TZ)
+    time.tzset()
+    try:
+        yield HOSTILE_TZ
+    finally:
+        # monkeypatch restores the variable, but only tzset() makes libc agree
+        # again -- and it has to run after the restore, hence the explicit undo.
+        monkeypatch.undo()
+        time.tzset()
 
 
 def make_row(

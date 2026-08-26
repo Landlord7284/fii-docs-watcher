@@ -9,11 +9,15 @@ from __future__ import annotations
 
 import importlib.util
 import sys
-from datetime import datetime
+import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
+
+from fii_docs_watcher import clock
+from fii_docs_watcher.clock import DEFAULT_TIMEZONE, set_timezone
 
 _SCHEDULER = Path(__file__).resolve().parents[2] / "docker" / "scheduler.py"
 
@@ -150,3 +154,75 @@ class TestTimezone:
         instant = datetime(2026, 8, 14, 8, 0, tzinfo=ZoneInfo("America/Sao_Paulo"))
         assert schedule.matches(instant)
         assert not schedule.matches(instant.astimezone(ZoneInfo("UTC")))
+
+
+class TestTheHostTimezoneIsIrrelevant:
+    """`[source].timezone` is the only zone this project declares.
+
+    The scheduler stays independent of the host because it feeds `matches()`
+    from `clock.now()` and never consults `TZ`. That is true today only because
+    nothing happens to read it -- which is not a guarantee, so these tests run
+    the real composition with `TZ` twelve hours away and pin it.
+    """
+
+    @pytest.fixture(autouse=True)
+    def restore_default(self):
+        # Process-wide state; leaving it changed re-dates every later test.
+        yield
+        set_timezone(DEFAULT_TIMEZONE)
+
+    def test_the_clock_the_loop_reads_is_the_source_clock(
+        self, hostile_host_timezone: str
+    ) -> None:
+        # Reached through `scheduler.clock`, not an import of our own: the
+        # point is that the moment *the loop* feeds to `matches()` is anchored
+        # to the source, so it is that object which has to be checked.
+        set_timezone("America/Sao_Paulo")
+        assert scheduler.clock.now().utcoffset() == timedelta(hours=-3)
+        # The host really is set to something else, or the assertion above is
+        # vacuous and this test would pass with the coupling reintroduced.
+        assert time.localtime().tm_gmtoff == 9 * 3600
+
+    def test_the_loop_never_consults_the_host_clock(self) -> None:
+        # The two tests above catch a leak through `clock`; this catches one
+        # that bypasses it. `TZ`, `tzset` and libc `localtime` have no business
+        # in this module, and a bare `datetime.now()` is the easy accident --
+        # it returns a naive local time that would match against host wall
+        # clock. Cheap to assert, and the only thing standing between a future
+        # edit and a schedule that silently fires at the wrong hour.
+        source = _SCHEDULER.read_text()
+        for forbidden in ('"TZ"', "'TZ'", "tzset", "localtime", "utcnow"):
+            assert forbidden not in source, f"{forbidden} reintroduces the host clock"
+        assert "datetime.now(" not in source
+        assert "date.today(" not in source
+
+    def test_the_schedule_fires_on_source_wall_clock_not_host_wall_clock(
+        self, hostile_host_timezone: str
+    ) -> None:
+        set_timezone("America/Sao_Paulo")
+        # 2026-08-14 08:00 in Sao Paulo is 2026-08-14 20:00 in Tokyo: the two
+        # zones disagree on the hour, so an implementation that read the host
+        # clock would fire at the wrong time and this test would catch it.
+        instant = datetime(2026, 8, 14, 11, 0, tzinfo=UTC)
+        assert instant.astimezone(clock.source_tz()).hour == 8
+        assert instant.astimezone(ZoneInfo("Asia/Tokyo")).hour == 20
+
+        schedule = Schedule.parse("0 8 * * *")
+        assert schedule.matches(instant.astimezone(clock.source_tz()))
+        assert not schedule.matches(instant.astimezone(ZoneInfo("Asia/Tokyo")))
+
+    def test_the_day_can_differ_between_the_two_zones(
+        self, hostile_host_timezone: str
+    ) -> None:
+        # Late evening in Sao Paulo is already the next day in Tokyo, so a
+        # schedule keyed on the day of the month is wrong by a whole date if
+        # the host clock ever leaks in.
+        set_timezone("America/Sao_Paulo")
+        instant = datetime(2026, 8, 15, 1, 0, tzinfo=UTC)
+        in_source = instant.astimezone(clock.source_tz())
+        in_host = instant.astimezone(ZoneInfo("Asia/Tokyo"))
+        assert (in_source.day, in_host.day) == (14, 15)
+
+        schedule = Schedule.parse("0 22 14 * *")
+        assert schedule.matches(in_source)
+        assert not schedule.matches(in_host)

@@ -109,7 +109,7 @@ The config file is **discovered**, so `--config` is rarely needed. First match w
 
 `doctor` prints which file it resolved.
 
-Any value can be overridden by environment variable, named `FII_WATCHER_<SECTION>_<KEY>`:
+Any value except `[source].timezone` can be overridden by environment variable, named `FII_WATCHER_<SECTION>_<KEY>`:
 
 ```bash
 FII_WATCHER_RETENTION_DAYS=14 fii-docs-watcher run

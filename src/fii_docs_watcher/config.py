@@ -3,8 +3,9 @@
 Portability rule from the spec: running the program once from a shell with a
 config file has to work, with no orchestrator, no baked-in path, no CNPJ and no
 credential anywhere in the code. Everything the robot needs to find is declared
-here, and every value can be overridden by `FII_WATCHER_<SECTION>_<KEY>` so a
-container can be configured without rewriting the file.
+here, and nearly every value can be overridden by `FII_WATCHER_<SECTION>_<KEY>`
+so a container can be configured without rewriting the file. The exception is
+`ENV_IMMUTABLE` below, whose one entry is deliberate rather than an oversight.
 
 The file is discovered rather than demanded, so the common case needs no flag.
 The one thing that must never happen quietly is falling back to the built-in
@@ -32,6 +33,17 @@ ENV_PREFIX = "FII_WATCHER_"
 
 # Environment variable naming the config file outright, for containers and cron.
 ENV_CONFIG_PATH = f"{ENV_PREFIX}CONFIG"
+
+# Keys that may only be declared in the config file, never from the environment.
+#
+# `[source].timezone` is the project's single declaration of what time it is
+# here: it governs the archive's directory names, the retention frontier, the
+# query window, the _inbox filename, the watermark and the log timestamps. A
+# second declaration in a `.env` -- a file that only exists under compose and is
+# invisible to a native install -- would let two deployments of the same archive
+# file the same document under different dates. Setting the variable is refused
+# rather than ignored, because a value with no effect is worse than an error.
+ENV_IMMUTABLE = frozenset({("source", "timezone")})
 
 # Searched in order when no path is given. Relative entries are resolved against
 # the working directory, which is why the project-local names come first: running
@@ -234,12 +246,25 @@ def _coerce(value: Any, annotation: Any, where: str) -> Any:
 
 
 def _env_overrides(section: str, keys: set[str]) -> dict[str, str]:
-    """Collect `FII_WATCHER_<SECTION>_<KEY>` variables for one section."""
+    """Collect `FII_WATCHER_<SECTION>_<KEY>` variables for one section.
+
+    Names are derived from the declared fields rather than scanned out of the
+    environment, so a variable that matches no key is simply never looked up.
+    An `ENV_IMMUTABLE` key is the one case that is refused instead of applied --
+    see the note on that table for why the timezone cannot be declared twice.
+    """
     out: dict[str, str] = {}
     for key in keys:
         env_name = f"{ENV_PREFIX}{section.upper()}_{key.upper()}"
-        if env_name in os.environ:
-            out[key] = os.environ[env_name]
+        if env_name not in os.environ:
+            continue
+        if (section, key) in ENV_IMMUTABLE:
+            raise ConfigError(
+                f"{env_name} is set, but [{section}].{key} cannot be overridden from "
+                f"the environment. Declare it in the config file instead, so that one "
+                f"file remains the only place it is named."
+            )
+        out[key] = os.environ[env_name]
     return out
 
 

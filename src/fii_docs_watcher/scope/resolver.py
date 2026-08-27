@@ -47,7 +47,7 @@ from datetime import timedelta
 
 from ..clock import to_dir_name, today
 from ..cvm.registry import RegistryEntity, RegistrySnapshot
-from ..errors import ScopeResolutionError, TransientSourceError, WatcherError
+from ..errors import ScopeResolutionError, TransientSourceError
 from ..fnet import funds as fnet_funds
 from ..fnet.client import FnetClient
 from ..fnet.funds import FundCandidate
@@ -110,7 +110,7 @@ def confirm_candidate(
             fundosnet_id=candidate.fundosnet_id,
             fund_type=fund_type,
         )
-    except (TransientSourceError, WatcherError) as exc:
+    except TransientSourceError as exc:
         log.warning(
             "could not confirm a candidate id against the listing",
             extra={"fundosnet_id": candidate.fundosnet_id, "error": str(exc)},
@@ -174,10 +174,22 @@ def _pick(
             continue
 
         # A handful only; needing more means the name is too generic to resolve
-        # unattended, and the interactive CLI path is the right tool for that.
+        # unattended, and silently considering only a prefix can select the wrong
+        # entity solely because of the source's result order.
+        if len(shortlist) > 5:
+            log.error(
+                "too many Fundos.NET ids matched one name; refusing automatic resolution",
+                extra={
+                    "target": target_name[:80],
+                    "fund_type": fund_type,
+                    "candidates": len(shortlist),
+                },
+            )
+            return None
+
         checked = [
             confirm_candidate(client, candidate, fund_type=fund_type)
-            for candidate in shortlist[:5]
+            for candidate in shortlist
         ]
 
         # Prefer a candidate that actually has documents; among equals, the one
@@ -212,9 +224,96 @@ def _entity_from(resolved: ResolvedCandidate, registry_entity: RegistryEntity) -
         fnet_fund_description=resolved.fnet_description,
         kind=registry_entity.kind,
         fnet_fund_type=resolved.fund_type,
-        validated_at=to_dir_name(today()),
+        validated_at=None,
         cnpj_confirmed=False,
     )
+
+
+def _resolve_registry_entities(
+    client: FnetClient, registry_entities: list[RegistryEntity]
+) -> tuple[list[Entity], int]:
+    """Resolve each registry entity while isolating only transient source failures."""
+    resolved_entities: list[Entity] = []
+    failures = 0
+    total = len(registry_entities)
+    for position, registry_entity in enumerate(registry_entities, start=1):
+        try:
+            log.info(
+                "entity %d/%d: searching Fundos.NET by name",
+                position,
+                total,
+                extra={
+                    "entity_cnpj": registry_entity.cnpj,
+                    "fund_types": list(registry_entity.candidate_fnet_types),
+                },
+            )
+            best = _pick(
+                client, registry_entity.legal_name, registry_entity.candidate_fnet_types
+            )
+        except TransientSourceError as exc:
+            failures += 1
+            log.warning(
+                "could not resolve an entity to a Fundos.NET id",
+                extra={"entity_cnpj": registry_entity.cnpj, "error": str(exc)},
+            )
+            continue
+
+        if best is None:
+            failures += 1
+            log.warning(
+                "no unambiguous Fundos.NET entry matched an entity's registered name",
+                extra={
+                    "entity_cnpj": registry_entity.cnpj,
+                    "legal_name": registry_entity.legal_name[:90],
+                },
+            )
+            continue
+
+        resolved_entities.append(_entity_from(best, registry_entity))
+    return resolved_entities, failures
+
+
+def _entity_identity(entity: Entity) -> tuple[int, int, str | None]:
+    """Identity whose CNPJ confirmation can safely be reused."""
+    return entity.fundosnet_id, entity.fnet_fund_type, entity.normalized_cnpj
+
+
+def _consolidate_entities(
+    resolved_entities: list[Entity], previous_entities: list[Entity]
+) -> tuple[list[Entity], int]:
+    """Deduplicate exact identities and reject one id assigned to different entities."""
+    by_id: dict[int, Entity] = {}
+    conflicted_ids: set[int] = set()
+    for entity in resolved_entities:
+        fundosnet_id = entity.fundosnet_id
+        prior = by_id.get(fundosnet_id)
+        if prior is None:
+            by_id[fundosnet_id] = entity
+            continue
+        if _entity_identity(prior) == _entity_identity(entity):
+            continue
+        conflicted_ids.add(fundosnet_id)
+        log.error(
+            "one Fundos.NET id resolved to conflicting entity identities; dropping it",
+            extra={
+                "fundosnet_id": fundosnet_id,
+                "first_cnpj": prior.cnpj,
+                "first_fund_type": prior.fnet_fund_type,
+                "other_cnpj": entity.cnpj,
+                "other_fund_type": entity.fnet_fund_type,
+            },
+        )
+
+    consolidated = [
+        entity for fundosnet_id, entity in by_id.items() if fundosnet_id not in conflicted_ids
+    ]
+    previous = {_entity_identity(entity): entity for entity in previous_entities}
+    for entity in consolidated:
+        prior = previous.get(_entity_identity(entity))
+        if prior is not None and prior.cnpj_confirmed:
+            entity.cnpj_confirmed = True
+            entity.validated_at = prior.validated_at
+    return consolidated, len(conflicted_ids)
 
 
 def resolve_scope(
@@ -265,66 +364,17 @@ def resolve_scope(
         target = snapshot.lookup(cnpj) or anchor
         registry_entities = [target]
 
-    resolved_entities: list[Entity] = []
-    failures = 0
-    total = len(registry_entities)
-    for position, registry_entity in enumerate(registry_entities, start=1):
-        try:
-            log.info(
-                "entity %d/%d: searching Fundos.NET by name",
-                position,
-                total,
-                extra={
-                    "entity_cnpj": registry_entity.cnpj,
-                    "fund_types": list(registry_entity.candidate_fnet_types),
-                },
-            )
-            best = _pick(
-                client, registry_entity.legal_name, registry_entity.candidate_fnet_types
-            )
-        except (TransientSourceError, WatcherError) as exc:
-            failures += 1
-            log.warning(
-                "could not resolve an entity to a Fundos.NET id",
-                extra={"entity_cnpj": registry_entity.cnpj, "error": str(exc)},
-            )
-            continue
+    resolved_entities, failures = _resolve_registry_entities(client, registry_entities)
+    consolidated, conflicts = _consolidate_entities(resolved_entities, scope.entities)
+    failures += conflicts
 
-        if best is None:
-            failures += 1
-            log.warning(
-                "no Fundos.NET entry matched an entity's registered name",
-                extra={
-                    "entity_cnpj": registry_entity.cnpj,
-                    "legal_name": registry_entity.legal_name[:90],
-                },
-            )
-            continue
-
-        resolved_entities.append(_entity_from(best, registry_entity))
-
-    if not resolved_entities:
+    if not consolidated:
         raise ScopeResolutionError(
             f"no entity of scope {scope.label} could be resolved to a Fundos.NET id",
             context={"cnpj": cnpj, "attempted": len(registry_entities)},
         )
 
-    # Two registry entities can resolve to one Fundos.NET id -- notably in a
-    # monoclass fund, where the fund and its class share a name and a CNPJ.
-    deduped: dict[int, Entity] = {}
-    for entity in resolved_entities:
-        deduped.setdefault(entity.fundosnet_id, entity)
-
-    # Carry forward confirmations already earned, so a CNPJ that a download has
-    # already validated does not have to be validated again after every sync.
-    previous = {e.fundosnet_id: e for e in scope.entities}
-    for fundosnet_id, entity in deduped.items():
-        prior = previous.get(fundosnet_id)
-        if prior is not None and prior.cnpj_confirmed:
-            entity.cnpj_confirmed = True
-            entity.validated_at = prior.validated_at
-
-    scope.entities = list(deduped.values())
+    scope.entities = consolidated
     scope.expansion = (
         ExpansionState.PARTIAL if failures else ExpansionState.COMPLETE
     )

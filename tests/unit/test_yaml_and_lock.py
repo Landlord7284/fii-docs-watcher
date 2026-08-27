@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 from pathlib import Path
 
 import pytest
 
 from fii_docs_watcher.errors import LockHeldError, YamlConflictError
 from fii_docs_watcher.lock import ProcessLock
+from fii_docs_watcher.scope import yaml_store
 from fii_docs_watcher.scope.models import Entity, ExpansionState, Scope
 from fii_docs_watcher.scope.yaml_store import FundsFile
 
@@ -89,6 +91,77 @@ class TestFundsFile:
 
         # Their edit is intact and the robot's update was dropped, not merged.
         assert path.read_text(encoding="utf-8") == edited
+
+    def test_an_edit_during_rendering_is_caught_before_replace(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        path = tmp_path / "funds.yaml"
+        path.write_text(AUTHORED, encoding="utf-8")
+        funds = FundsFile.load(path)
+        original_render = funds.render
+        edited = AUTHORED + '  - cnpj: "11222333000181"\n'
+
+        def render_after_edit() -> str:
+            rendered = original_render()
+            path.write_text(edited, encoding="utf-8")
+            return rendered
+
+        monkeypatch.setattr(funds, "render", render_after_edit)
+        with pytest.raises(YamlConflictError, match="while its update was prepared"):
+            funds.save()
+
+        assert path.read_text(encoding="utf-8") == edited
+        leftovers = [
+            candidate for candidate in tmp_path.iterdir() if candidate.name.endswith(".tmp")
+        ]
+        assert not leftovers
+
+    def test_each_save_uses_a_unique_temporary(self, tmp_path: Path, monkeypatch) -> None:
+        path = tmp_path / "funds.yaml"
+        funds = FundsFile.load(path)
+        staged: list[Path] = []
+        original_stage = yaml_store._stage_write
+
+        def record_stage(target: Path, data: bytes) -> Path:
+            temporary = original_stage(target, data)
+            staged.append(temporary)
+            return temporary
+
+        monkeypatch.setattr(yaml_store, "_stage_write", record_stage)
+        funds.save()
+        funds.save()
+
+        assert len(staged) == 2
+        assert staged[0] != staged[1]
+        assert all(path.name != ".funds.yaml.tmp" for path in staged)
+        assert all(not path.exists() for path in staged)
+        assert stat.S_IMODE(path.stat().st_mode) == 0o644
+
+    def test_a_failed_backup_replace_keeps_the_previous_backup(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        path = tmp_path / "funds.yaml"
+        backup = tmp_path / "funds.yaml.bak"
+        path.write_text(AUTHORED, encoding="utf-8")
+        backup.write_text("previous backup", encoding="utf-8")
+        funds = FundsFile.load(path)
+        original_replace = Path.replace
+
+        def fail_backup_replace(source: Path, target: Path) -> Path:
+            if target == backup:
+                raise OSError("backup unavailable")
+            return original_replace(source, target)
+
+        monkeypatch.setattr(Path, "replace", fail_backup_replace)
+        with pytest.raises(OSError, match="backup unavailable"):
+            funds.save(backup=backup)
+
+        assert backup.read_text(encoding="utf-8") == "previous backup"
+        assert path.read_text(encoding="utf-8") == AUTHORED
+        leftovers = [
+            candidate for candidate in tmp_path.iterdir() if candidate.name.endswith(".tmp")
+        ]
+        assert not leftovers
 
     def test_a_backup_of_the_previous_version_is_kept(self, tmp_path: Path) -> None:
         path = tmp_path / "funds.yaml"
@@ -279,6 +352,81 @@ class TestScopeSearch:
         bare = Scope(cnpj="12.005.956/0001-65")
         assert bare.matches("12005956")
         assert not bare.matches("kinea")
+
+    def test_letters_with_digits_are_not_treated_as_a_cnpj_fragment(self) -> None:
+        assert not self._scope().matches("XPTO12")
+
+
+class TestEntityFieldParsing:
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            (True, True),
+            (False, False),
+            ("true", True),
+            ("false", False),
+            ("yes", True),
+            ("0", False),
+        ],
+    )
+    def test_cnpj_confirmation_uses_explicit_boolean_parsing(
+        self, tmp_path: Path, raw: object, expected: bool
+    ) -> None:
+        path = tmp_path / "funds.yaml"
+        path.write_text(
+            "scopes:\n"
+            '  - cnpj: "08.431.747/0001-06"\n'
+            "    entities:\n"
+            '      - cnpj: "08.431.747/0001-06"\n'
+            "        fundosnet_id: 21348\n"
+            f"        cnpj_confirmed: {raw!r}\n",
+            encoding="utf-8",
+        )
+
+        entity = FundsFile.load(path).scopes()[0].entities[0]
+
+        assert entity.cnpj_confirmed is expected
+
+    def test_invalid_confirmation_defaults_to_false_and_warns(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        path = tmp_path / "funds.yaml"
+        path.write_text(
+            "scopes:\n"
+            '  - cnpj: "08.431.747/0001-06"\n'
+            "    entities:\n"
+            '      - cnpj: "08.431.747/0001-06"\n'
+            "        fundosnet_id: 21348\n"
+            "        cnpj_confirmed: 2\n",
+            encoding="utf-8",
+        )
+
+        entity = FundsFile.load(path).scopes()[0].entities[0]
+
+        assert entity.cnpj_confirmed is False
+        assert "invalid cnpj_confirmed" in caplog.text
+
+    def test_legacy_validation_date_is_dropped_when_confirmation_is_false(
+        self, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "funds.yaml"
+        path.write_text(
+            "scopes:\n"
+            '  - cnpj: "08.431.747/0001-06"\n'
+            "    entities:\n"
+            '      - cnpj: "08.431.747/0001-06"\n'
+            "        fundosnet_id: 21348\n"
+            '        validated_at: "2026-08-20"\n'
+            "        cnpj_confirmed: false\n",
+            encoding="utf-8",
+        )
+        funds = FundsFile.load(path)
+        scope = funds.scopes()[0]
+
+        assert scope.entities[0].validated_at is None
+        funds.update_scope(scope)
+        funds.save()
+        assert "validated_at" not in path.read_text(encoding="utf-8")
 
 
 class TestTickerEditing:

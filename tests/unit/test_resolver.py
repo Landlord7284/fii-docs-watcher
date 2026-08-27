@@ -16,9 +16,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from conftest import FakeFnet, make_row
 from fii_docs_watcher.cvm.registry import RegistryEntity
-from fii_docs_watcher.errors import ScopeResolutionError
+from fii_docs_watcher.errors import ScopeResolutionError, SourceContractError, TransientSourceError
 from fii_docs_watcher.fnet.client import FnetClient
-from fii_docs_watcher.scope.models import Scope
+from fii_docs_watcher.scope import resolver
+from fii_docs_watcher.scope.models import Entity, Scope
 from fii_docs_watcher.scope.resolver import resolve_scope
 
 REAL_ESTATE = 1
@@ -110,3 +111,102 @@ class TestFundTypeDiscovery:
                 resolve_scope(client, FakeSnapshot(None), scope)
 
         assert fake_fnet.request_log == []
+
+
+class TestResolutionFailureSafety:
+    def test_a_contract_error_during_confirmation_propagates(
+        self, config, fake_fnet, monkeypatch
+    ) -> None:
+        fake_fnet.add_fund(NAME, [{"id": FUND_ID, "text": NAME}])
+
+        def fail_probe(*_args, **_kwargs):
+            raise SourceContractError("listing schema changed")
+
+        monkeypatch.setattr(resolver, "probe", fail_probe)
+        with _client(config, fake_fnet) as client:
+            with pytest.raises(SourceContractError, match="schema changed"):
+                resolve_scope(client, FakeSnapshot(_entity((REAL_ESTATE,))), Scope(cnpj=CNPJ))
+
+    def test_a_transient_confirmation_failure_keeps_the_candidate_unconfirmed(
+        self, config, fake_fnet, monkeypatch
+    ) -> None:
+        fake_fnet.add_fund(NAME, [{"id": FUND_ID, "text": NAME}])
+
+        def fail_probe(*_args, **_kwargs):
+            raise TransientSourceError("temporary outage")
+
+        monkeypatch.setattr(resolver, "probe", fail_probe)
+        scope = Scope(cnpj=CNPJ)
+        with _client(config, fake_fnet) as client:
+            resolve_scope(client, FakeSnapshot(_entity((REAL_ESTATE,))), scope)
+
+        assert scope.entities[0].fundosnet_id == FUND_ID
+        assert scope.entities[0].cnpj_confirmed is False
+        assert scope.entities[0].validated_at is None
+
+    def test_more_than_five_exact_matches_are_not_truncated_and_guessed(
+        self, config, fake_fnet
+    ) -> None:
+        fake_fnet.add_fund(
+            NAME, [{"id": FUND_ID + index, "text": NAME} for index in range(6)]
+        )
+
+        with _client(config, fake_fnet) as client:
+            with pytest.raises(ScopeResolutionError):
+                resolve_scope(client, FakeSnapshot(_entity((REAL_ESTATE,))), Scope(cnpj=CNPJ))
+
+        probes = [
+            entry
+            for entry in fake_fnet.request_log
+            if entry.startswith("pesquisarGerenciadorDocumentosDados")
+        ]
+        assert probes == []
+
+
+class TestEntityConsolidation:
+    def test_exact_duplicate_identities_are_collapsed_and_confirmation_is_carried(self) -> None:
+        previous = Entity(
+            cnpj=CNPJ,
+            fundosnet_id=FUND_ID,
+            fnet_fund_type=AGRO,
+            validated_at="2026-08-26",
+            cnpj_confirmed=True,
+        )
+        resolved = [
+            Entity(cnpj=CNPJ, fundosnet_id=FUND_ID, fnet_fund_type=AGRO),
+            Entity(cnpj=CNPJ, fundosnet_id=FUND_ID, fnet_fund_type=AGRO),
+        ]
+
+        entities, conflicts = resolver._consolidate_entities(resolved, [previous])
+
+        assert conflicts == 0
+        assert len(entities) == 1
+        assert entities[0].cnpj_confirmed is True
+        assert entities[0].validated_at == "2026-08-26"
+
+    def test_one_id_assigned_to_different_cnpjs_is_rejected(self) -> None:
+        resolved = [
+            Entity(cnpj=CNPJ, fundosnet_id=FUND_ID, fnet_fund_type=REAL_ESTATE),
+            Entity(cnpj="08431747000106", fundosnet_id=FUND_ID, fnet_fund_type=REAL_ESTATE),
+        ]
+
+        entities, conflicts = resolver._consolidate_entities(resolved, [])
+
+        assert entities == []
+        assert conflicts == 1
+
+    def test_confirmation_is_not_carried_to_a_different_fund_type(self) -> None:
+        previous = Entity(
+            cnpj=CNPJ,
+            fundosnet_id=FUND_ID,
+            fnet_fund_type=AGRO,
+            validated_at="2026-08-26",
+            cnpj_confirmed=True,
+        )
+        resolved = Entity(cnpj=CNPJ, fundosnet_id=FUND_ID, fnet_fund_type=REAL_ESTATE)
+
+        entities, conflicts = resolver._consolidate_entities([resolved], [previous])
+
+        assert conflicts == 0
+        assert entities[0].cnpj_confirmed is False
+        assert entities[0].validated_at is None

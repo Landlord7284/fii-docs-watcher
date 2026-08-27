@@ -108,7 +108,7 @@ class Scope:
             return True
 
         digits = re.sub(r"\D", "", needle)
-        if digits:
+        if digits and not any(character.isalpha() for character in needle):
             haystack_digits = [self.normalized_cnpj or ""]
             haystack_digits += [e.normalized_cnpj or "" for e in self.entities]
             if any(digits in candidate for candidate in haystack_digits):

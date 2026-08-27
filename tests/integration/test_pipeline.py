@@ -1278,6 +1278,7 @@ class TestCnpjValidation:
         fake.add_documents(FUND_ID, [make_row(1001)])
         _cycle(config, repo, scopes, client, retention_window(7))
         assert scopes[0].entities[0].cnpj_confirmed is True
+        assert scopes[0].entities[0].validated_at == to_dir_name(today())
 
     def test_a_foreign_cnpj_blocks_the_document_and_is_critical(self, env, caplog) -> None:
         import logging

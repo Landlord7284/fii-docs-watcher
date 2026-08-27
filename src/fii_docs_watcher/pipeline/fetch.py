@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 
-from ..clock import parse_dir_name, to_dir_name
+from ..clock import parse_dir_name, to_dir_name, today
 from ..config import Config
 from ..errors import (
     CnpjDivergenceError,
@@ -46,7 +46,7 @@ from ..fnet.download import fetch as fetch_document
 from ..fnet.schema import looks_structured
 from ..manifest.repo import AttemptOutcome, LocalState, ManifestDocument, ManifestRepo
 from ..scope.cnpj import format_masked, same
-from ..scope.models import Scope
+from ..scope.models import Entity, Scope
 from . import naming
 
 log = logging.getLogger(__name__)
@@ -78,12 +78,12 @@ class EntityIndex:
     """
 
     def __init__(self, scopes: list[Scope]) -> None:
-        self._by_id: dict[int, tuple[Scope, object]] = {}
+        self._by_id: dict[int, tuple[Scope, Entity]] = {}
         for scope in scopes:
             for entity in scope.entities:
                 self._by_id[entity.fundosnet_id] = (scope, entity)
 
-    def get(self, fundosnet_id: int) -> tuple[Scope, object] | None:
+    def get(self, fundosnet_id: int) -> tuple[Scope, Entity] | None:
         return self._by_id.get(fundosnet_id)
 
 
@@ -97,7 +97,7 @@ def _ensure_dir(path: Path, mode: int) -> None:
 
 def _check_cnpj(
     scope: Scope,
-    entity: object,
+    entity: Entity,
     document: ManifestDocument,
     served_cnpj: str | None,
     report: FetchReport,
@@ -115,10 +115,12 @@ def _check_cnpj(
     if served_cnpj is None:
         return
 
-    expected = getattr(entity, "normalized_cnpj", None)
+    expected = entity.normalized_cnpj
     if same(served_cnpj, expected):
-        if not getattr(entity, "cnpj_confirmed", False):
-            entity.cnpj_confirmed = True  # type: ignore[attr-defined]
+        if entity.validated_at is None:
+            entity.validated_at = to_dir_name(today())
+        if not entity.cnpj_confirmed:
+            entity.cnpj_confirmed = True
             log.info(
                 "entity CNPJ confirmed by a downloaded document",
                 extra={

@@ -26,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import tempfile
 from io import StringIO
 from pathlib import Path
 
@@ -76,6 +77,43 @@ def _yaml() -> YAML:
 
 def _digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _stage_write(path: Path, data: bytes) -> Path:
+    """Write and sync a unique same-directory temporary, returning its path."""
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False
+        ) as handle:
+            temporary = Path(handle.name)
+            os.fchmod(handle.fileno(), 0o644)
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        return temporary
+    except BaseException:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        raise
+
+
+def _fsync_directory(path: Path) -> None:
+    """Make a completed rename durable, not merely atomic to concurrent readers."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _write_atomic(path: Path, data: bytes) -> None:
+    temporary = _stage_write(path, data)
+    try:
+        temporary.replace(path)
+        _fsync_directory(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 class FundsFile:
@@ -231,9 +269,10 @@ class FundsFile:
         Raises `YamlConflictError` when the file changed on disk since it was
         loaded. The caller reports it; the user's version stays untouched.
         """
-        current_digest: str | None = None
+        current: bytes | None = None
         if self.path.exists():
-            current_digest = _digest(self.path.read_bytes())
+            current = self.path.read_bytes()
+        current_digest = _digest(current) if current is not None else None
 
         if current_digest != self._source_digest:
             raise YamlConflictError(
@@ -245,21 +284,25 @@ class FundsFile:
         rendered = self.render().encode("utf-8")
 
         # Keep the last good version. Cheap insurance on a file a human maintains.
-        if backup is not None and self.path.exists():
-            backup.write_bytes(self.path.read_bytes())
+        if backup is not None and current is not None:
+            _write_atomic(backup, current)
 
-        # Same directory, so the rename stays within one filesystem and is atomic.
-        tmp = self.path.with_name(f".{self.path.name}.tmp")
-        fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+        # Prepare everything before the final digest check, leaving the smallest
+        # practical interval between checking the human's file and replacing it.
+        temporary = _stage_write(self.path, rendered)
         try:
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(rendered)
-                handle.flush()
-                os.fsync(handle.fileno())
-            tmp.replace(self.path)
-        except BaseException:
-            tmp.unlink(missing_ok=True)
-            raise
+            latest = self.path.read_bytes() if self.path.exists() else None
+            latest_digest = _digest(latest) if latest is not None else None
+            if latest_digest != self._source_digest:
+                raise YamlConflictError(
+                    f"{self.path} changed on disk while its update was prepared; keeping your "
+                    "edit and discarding the robot's update. It will be reapplied on the next run.",
+                    context={"path": str(self.path)},
+                )
+            temporary.replace(self.path)
+            _fsync_directory(self.path.parent)
+        finally:
+            temporary.unlink(missing_ok=True)
 
         self._source_digest = _digest(rendered)
         log.debug("funds file written", extra={"path": str(self.path)})
@@ -302,6 +345,7 @@ def _scope_from_entry(entry: dict) -> Scope:
                 extra={"value": repr(fundosnet_id)},
             )
             continue
+        confirmed = _opt_bool(raw.get("cnpj_confirmed"), default=False)
         entities.append(
             Entity(
                 cnpj=str(raw.get("cnpj")),
@@ -309,8 +353,8 @@ def _scope_from_entry(entry: dict) -> Scope:
                 fnet_fund_description=str(raw.get("fnet_fund_description") or ""),
                 kind=str(raw.get("kind") or "fund_or_class"),
                 fnet_fund_type=_opt_int(raw.get("fnet_fund_type"), default=1),
-                validated_at=_opt_str(raw.get("validated_at")),
-                cnpj_confirmed=bool(raw.get("cnpj_confirmed", False)),
+                validated_at=_opt_str(raw.get("validated_at")) if confirmed else None,
+                cnpj_confirmed=confirmed,
             )
         )
 
@@ -353,6 +397,25 @@ def _opt_int(value: object, *, default: int) -> int:
         return default
 
 
+def _opt_bool(value: object, *, default: bool) -> bool:
+    """Read a YAML boolean without treating every non-empty string as true."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "yes", "1"}:
+            return True
+        if normalized in {"false", "no", "0", ""}:
+            return False
+    log.warning(
+        "entity has an invalid cnpj_confirmed value; using the default",
+        extra={"value": repr(value), "default": default},
+    )
+    return default
+
+
 def _apply_scope(entry: CommentedMap, scope: Scope) -> None:
     """Write the robot-owned fields into an existing entry, in a stable order.
 
@@ -381,7 +444,8 @@ def _apply_scope(entry: CommentedMap, scope: Scope) -> None:
         item["fundosnet_id"] = entity.fundosnet_id
         item["fnet_fund_type"] = entity.fnet_fund_type
         item["fnet_fund_description"] = entity.fnet_fund_description
-        item["validated_at"] = Quoted(entity.validated_at or to_dir_name(today()))
+        if entity.cnpj_confirmed and entity.validated_at:
+            item["validated_at"] = Quoted(entity.validated_at)
         item["cnpj_confirmed"] = entity.cnpj_confirmed
         entities.append(item)
     entry["entities"] = entities

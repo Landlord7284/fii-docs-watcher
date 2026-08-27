@@ -134,7 +134,6 @@ class FnetClient:
             started = time.monotonic()
             try:
                 with self._client.stream("GET", url, params=params) as response:
-                    body = self._read_capped(response, url)
                     self._last_request = time.monotonic()
                     elapsed = self._last_request - started
 
@@ -159,6 +158,10 @@ class FnetClient:
                             f"HTTP {response.status_code} from {url}",
                             context={"url": url, "status": response.status_code},
                         )
+
+                    body = self._read_capped(response, url)
+                    self._last_request = time.monotonic()
+                    elapsed = self._last_request - started
 
                     log.debug(
                         "request ok",

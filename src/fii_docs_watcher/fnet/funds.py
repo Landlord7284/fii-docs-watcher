@@ -70,9 +70,16 @@ def _parse(payload: Any) -> tuple[list[FundCandidate], bool]:
             "listarFundos response has no 'results' array",
             context={"keys": sorted(payload) if isinstance(payload, dict) else type(payload)},
         )
+    results = payload["results"]
+    if not isinstance(results, list):
+        raise SourceContractError(
+            "listarFundos response 'results' is not an array",
+            context={"type": type(results).__name__},
+        )
     candidates: list[FundCandidate] = []
-    for entry in payload.get("results") or []:
+    for entry in results:
         if not isinstance(entry, dict) or entry.get("id") is None:
+            log.warning("skipping malformed listarFundos entry", extra={"entry": entry})
             continue
         try:
             fundosnet_id = int(entry["id"])

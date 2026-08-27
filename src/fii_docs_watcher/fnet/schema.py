@@ -29,8 +29,9 @@ from ..errors import SourceContractError
 log = logging.getLogger(__name__)
 
 # Absence or unusable type here invalidates the record (spec section 8).
-# `status` is included because "cancelled" has to be observable; `especieDocumento`
-# is not, because it is legitimately empty outside Assembleia.
+# Status is validated separately because the source exposes two fallback keys and
+# "cancelled" has to remain observable. `especieDocumento` is not critical because
+# it is legitimately empty outside Assembleia.
 CRITICAL_FIELDS = (
     "id",
     "versao",
@@ -117,7 +118,9 @@ def parse_row(raw: dict[str, Any]) -> DocumentRow:
 
     Raises `SourceContractError` when a critical field is missing or unusable.
     """
-    missing = [name for name in CRITICAL_FIELDS if raw.get(name) in (None, "")]
+    missing = [name for name in CRITICAL_FIELDS if not _text(raw.get(name))]
+    if not (_text(raw.get("descricaoStatus")) or _text(raw.get("status"))):
+        missing.append("descricaoStatus/status")
     if missing:
         raise SourceContractError(
             f"listing row is missing critical field(s): {', '.join(missing)}",
@@ -148,7 +151,7 @@ def parse_row(raw: dict[str, Any]) -> DocumentRow:
     )
 
 
-def parse_rows(raws: list[dict[str, Any]]) -> tuple[list[DocumentRow], list[SourceContractError]]:
+def parse_rows(raws: list[Any]) -> tuple[list[DocumentRow], list[SourceContractError]]:
     """Parse a page, isolating bad rows instead of losing the good ones.
 
     A single malformed row is recorded and skipped; the caller decides how loudly
@@ -158,8 +161,22 @@ def parse_rows(raws: list[dict[str, Any]]) -> tuple[list[DocumentRow], list[Sour
     rows: list[DocumentRow] = []
     errors: list[SourceContractError] = []
     for raw in raws:
+        if not isinstance(raw, dict):
+            errors.append(
+                SourceContractError(
+                    f"listing row is not an object: {type(raw).__name__}",
+                    context={
+                        "type": type(raw).__name__,
+                        "row_fingerprint": repr(raw),
+                    },
+                )
+            )
+            continue
         try:
             rows.append(parse_row(raw))
         except SourceContractError as exc:
+            # Pagination can repeat a malformed row across page boundaries. Keep a
+            # stable key so coverage counts that source row only once.
+            exc.context.setdefault("row_fingerprint", repr(sorted(raw.items())))
             errors.append(exc)
     return rows, errors

@@ -114,6 +114,32 @@ def _search_params(
     return params
 
 
+def _parse_search_payload(payload: Any) -> tuple[list[Any], int]:
+    """Validate the page envelope shared by scans and one-request probes."""
+    if not isinstance(payload, dict) or "data" not in payload:
+        raise SourceContractError(
+            "search response has no 'data' array",
+            context={"keys": sorted(payload) if isinstance(payload, dict) else type(payload)},
+        )
+    batch = payload["data"]
+    if not isinstance(batch, list):
+        raise SourceContractError(
+            "search response 'data' is not an array",
+            context={"type": type(batch).__name__},
+        )
+    if "recordsFiltered" not in payload:
+        raise SourceContractError("search response has no 'recordsFiltered' count")
+    try:
+        total = int(payload["recordsFiltered"])
+    except (TypeError, ValueError) as exc:
+        raise SourceContractError(
+            f"recordsFiltered is not an integer: {payload['recordsFiltered']!r}"
+        ) from exc
+    if total < 0:
+        raise SourceContractError(f"recordsFiltered is negative: {total}")
+    return batch, total
+
+
 def _pages(
     client: FnetClient,
     *,
@@ -138,18 +164,7 @@ def _pages(
                 fund_type=fund_type,
             ),
         ).json()
-        if not isinstance(payload, dict) or "data" not in payload:
-            raise SourceContractError(
-                "search response has no 'data' array",
-                context={"keys": sorted(payload) if isinstance(payload, dict) else type(payload)},
-            )
-        batch = payload.get("data") or []
-        try:
-            total = int(payload.get("recordsFiltered", 0))
-        except (TypeError, ValueError) as exc:
-            raise SourceContractError(
-                f"recordsFiltered is not an integer: {payload.get('recordsFiltered')!r}"
-            ) from exc
+        batch, total = _parse_search_payload(payload)
 
         yield batch, total
         seen += len(batch)
@@ -189,19 +204,8 @@ def probe(
             fund_type=fund_type,
         ),
     ).json()
-    if not isinstance(payload, dict) or "data" not in payload:
-        raise SourceContractError(
-            "search response has no 'data' array",
-            context={"keys": sorted(payload) if isinstance(payload, dict) else type(payload)},
-        )
-    try:
-        total = int(payload.get("recordsFiltered", 0))
-    except (TypeError, ValueError) as exc:
-        raise SourceContractError(
-            f"recordsFiltered is not an integer: {payload.get('recordsFiltered')!r}"
-        ) from exc
-
-    rows, _errors = parse_rows(payload.get("data") or [])
+    batch, total = _parse_search_payload(payload)
+    rows, _errors = parse_rows(batch)
     return ProbeResult(records_filtered=total, first_row=rows[0] if rows else None)
 
 
@@ -233,6 +237,7 @@ def scan(
     for attempt in range(1, MAX_SCAN_ATTEMPTS + 1):
         by_identity: dict[tuple[int, int], DocumentRow] = {}
         errors: list[SourceContractError] = []
+        error_fingerprints: set[str] = set()
         records_filtered = 0
         pages = 0
 
@@ -247,7 +252,11 @@ def scan(
             pages += 1
             records_filtered = max(records_filtered, total)
             rows, row_errors = parse_rows(batch)
-            errors.extend(row_errors)
+            for error in row_errors:
+                fingerprint = str(error.context.get("row_fingerprint", str(error)))
+                if fingerprint not in error_fingerprints:
+                    error_fingerprints.add(fingerprint)
+                    errors.append(error)
             for row in rows:
                 # Deduplicate by publication identity. The source repeats rows
                 # across pages when ordering drifts; the same document arriving

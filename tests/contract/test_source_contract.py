@@ -99,6 +99,27 @@ class TestClientBehaviour:
             with pytest.raises(SourceContractError, match="max_response_bytes"):
                 client.get("x")
 
+    def test_an_oversized_retryable_response_is_retried_before_reading_its_body(self) -> None:
+        calls = {"n": 0}
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return httpx.Response(500, content=b"x" * 5000)
+            return httpx.Response(200, json={"ok": True})
+
+        config = SourceConfig(
+            base_url="https://fnet.test/f",
+            min_request_interval_seconds=0.0,
+            backoff_base_seconds=0.0,
+            backoff_max_seconds=0.0,
+            max_response_bytes=100,
+            max_retries=1,
+        )
+        with FnetClient(config, transport=httpx.MockTransport(handler)) as client:
+            assert client.get("x").json() == {"ok": True}
+        assert calls["n"] == 2
+
     def test_an_identifiable_user_agent_is_always_sent(self) -> None:
         seen: dict[str, str] = {}
 
@@ -149,6 +170,58 @@ class TestListarFundosPagination:
         )
         assert bare.denomination == "URBANITY CORPORATE - FUNDO DE INVESTIMENTO IMOBILIÁRIO"
 
+    def test_results_must_be_an_array(self) -> None:
+        config = SourceConfig(
+            base_url="https://fnet.test/f", min_request_interval_seconds=0.0, max_retries=0
+        )
+        transport = httpx.MockTransport(
+            lambda _r: httpx.Response(200, json={"results": {"id": 1}, "more": False})
+        )
+        with FnetClient(config, transport=transport) as client:
+            with pytest.raises(SourceContractError, match="not an array"):
+                fnet_funds.search(client, "FUND")
+
+
+class TestListingEnvelope:
+    def _client(self, handler) -> FnetClient:
+        config = SourceConfig(
+            base_url="https://fnet.test/f", min_request_interval_seconds=0.0, max_retries=0
+        )
+        return FnetClient(config, transport=httpx.MockTransport(handler))
+
+    def test_records_filtered_is_required(self) -> None:
+        payload = {"data": []}
+        with self._client(lambda _r: httpx.Response(200, json=payload)) as client:
+            with pytest.raises(SourceContractError, match="recordsFiltered"):
+                scan(client, first=date(2026, 8, 27), last=date(2026, 8, 27))
+
+    def test_data_must_be_an_array(self) -> None:
+        payload = {"data": {"id": 1}, "recordsFiltered": 1}
+        with self._client(lambda _r: httpx.Response(200, json=payload)) as client:
+            with pytest.raises(SourceContractError, match="not an array"):
+                scan(client, first=date(2026, 8, 27), last=date(2026, 8, 27))
+
+    def test_a_repeated_invalid_row_cannot_satisfy_distinct_coverage(self) -> None:
+        invalid = {
+            "id": None,
+            "versao": 1,
+            "dataEntrega": "27/08/2026 09:30",
+            "categoriaDocumento": "X",
+            "descricaoFundo": "FUND",
+            "descricaoStatus": "Ativo",
+        }
+        payload = {"data": [invalid], "recordsFiltered": 2}
+        with self._client(lambda _r: httpx.Response(200, json=payload)) as client:
+            result = scan(
+                client,
+                first=date(2026, 8, 27),
+                last=date(2026, 8, 27),
+                page_length=1,
+            )
+        assert not result.complete
+        assert len(result.row_errors) == 1
+        assert result.attempts == 3
+
 
 @pytest.mark.live
 class TestLiveSource:
@@ -161,9 +234,11 @@ class TestLiveSource:
             ok = scan(client, first=window_start, last=window_end, page_length=MAX_PAGE_LENGTH)
             assert ok.records_filtered > 0
 
-            # Above the ceiling the endpoint answers HTTP 500 rather than
-            # truncating, so the client exhausts its retries and gives up.
-            with pytest.raises(TransientSourceError):
+            # Above the ceiling the endpoint refuses the request, but its error
+            # envelope is not stable: it has returned both HTTP 500 and HTTP 200
+            # carrying the Fundos.NET HTML page. Neither may be accepted as a
+            # document-listing response.
+            with pytest.raises((TransientSourceError, SourceContractError)):
                 scan(client, first=window_start, last=window_end, page_length=500)
 
     def test_a_paginated_scan_still_covers_every_row(self) -> None:

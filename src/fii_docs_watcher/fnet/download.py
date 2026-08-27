@@ -38,6 +38,7 @@ log = logging.getLogger(__name__)
 DOWNLOAD_PATH = "downloadDocumento"
 
 PDF_SIGNATURE = b"%PDF-"
+PDF_EOF = b"%%EOF"
 
 # Roots seen on real documents. The check is a denylist plus a sanity rule
 # rather than an allowlist: the source adds document types over time, and
@@ -154,7 +155,29 @@ def validate(
     if not content:
         raise ContentValidationError("empty response body", context=context)
 
+    identity_mismatches: list[str] = []
+    if served.document_id is not None and served.document_id != document_id:
+        identity_mismatches.append(
+            f"document id {served.document_id} (requested {document_id})"
+        )
+    if served.version is not None and served.version != version:
+        identity_mismatches.append(f"version {served.version} (requested {version})")
+    if identity_mismatches:
+        raise ContentValidationError(
+            "served filename identifies a different publication: "
+            + ", ".join(identity_mismatches),
+            context={
+                **context,
+                "served_document_id": served.document_id,
+                "served_version": served.version,
+            },
+        )
+
     if content.startswith(PDF_SIGNATURE):
+        if not content.rstrip().endswith(PDF_EOF):
+            raise ContentValidationError(
+                "PDF is truncated or corrupt: missing terminal %%EOF marker", context=context
+            )
         return ContentKind.PDF, "pdf"
 
     if _XML_DECL.match(content):

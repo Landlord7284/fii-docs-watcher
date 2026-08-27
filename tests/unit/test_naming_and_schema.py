@@ -164,6 +164,10 @@ class TestSchemaValidation:
         assert row.species == ""
         assert row.reference_date is None
 
+    def test_status_is_critical_because_cancellation_must_remain_observable(self) -> None:
+        with pytest.raises(SourceContractError, match="descricaoStatus/status"):
+            parse_row(self._row(descricaoStatus=None, status=None))
+
     def test_the_always_null_identity_fields_are_simply_ignored(self) -> None:
         row = parse_row(self._row(cnpjFundo=None, idFundo=None, nomeAdministrador=None))
         assert row.identity == (1291164, 1)
@@ -180,3 +184,9 @@ class TestSchemaValidation:
         rows, errors = parse_rows([self._row(), self._row(id=None), self._row(id=99)])
         assert [r.document_id for r in rows] == [1291164, 99]
         assert len(errors) == 1
+
+    def test_a_non_object_row_is_isolated_as_a_contract_error(self) -> None:
+        rows, errors = parse_rows([self._row(), "not-an-object"])
+        assert [row.document_id for row in rows] == [1291164]
+        assert len(errors) == 1
+        assert "not an object" in str(errors[0])

@@ -17,7 +17,9 @@ REAL_XML = (
     b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n'
     b"<DadosEconomicoFinanceiros><x/></DadosEconomicoFinanceiros>"
 )
-REAL_PDF = b"%PDF-1.6\r%\xe2\xe3\xcf\xd3\r\n218 0 obj\r<</Linearized 1>>\rendobj\r"
+REAL_PDF = (
+    b"%PDF-1.6\r%\xe2\xe3\xcf\xd3\r\n218 0 obj\r<</Linearized 1>>\rendobj\r%%EOF\r\n"
+)
 
 
 def _validate(content: bytes, **kwargs: object):
@@ -92,6 +94,10 @@ class TestRejects:
         with pytest.raises(ContentValidationError, match="unrecognised"):
             _validate(b"%PDF")
 
+    def test_pdf_with_a_header_but_no_terminal_marker_is_rejected(self) -> None:
+        with pytest.raises(ContentValidationError, match="truncated or corrupt"):
+            _validate(b"%PDF-1.7\n1 0 obj\n")
+
     def test_arbitrary_bytes(self) -> None:
         with pytest.raises(ContentValidationError, match="unrecognised"):
             _validate(b"\x00\x01\x02 not a document")
@@ -147,3 +153,16 @@ class TestContentDisposition:
         assert not served.parsed
         assert served.filename == "something-else.pdf"
         assert served.cnpj is None
+
+    @pytest.mark.parametrize(
+        ("served", "message"),
+        [
+            (ServedFile(document_id=2, version=1), "document id"),
+            (ServedFile(document_id=1, version=2), "version"),
+        ],
+    )
+    def test_served_publication_identity_must_match_the_request(
+        self, served: ServedFile, message: str
+    ) -> None:
+        with pytest.raises(ContentValidationError, match=message):
+            _validate(REAL_PDF, served=served)

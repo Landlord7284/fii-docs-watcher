@@ -42,7 +42,12 @@ class PurgeReport:
     errors: list[str] = field(default_factory=list)
 
 
-def remove_files(config: Config, documents: Iterable[ManifestDocument]) -> list[tuple[int, int]]:
+def remove_files(
+    config: Config,
+    documents: Iterable[ManifestDocument],
+    *,
+    errors: list[str] | None = None,
+) -> list[tuple[int, int]]:
     """Delete the archived file of each document, and return what was removed.
 
     Shared by the two callers that delete individual files rather than a whole
@@ -65,6 +70,8 @@ def remove_files(config: Config, documents: Iterable[ManifestDocument]) -> list[
             touched_dirs.add(path.parent)
             removed.append((document.document_id, document.version))
         except OSError as exc:
+            if errors is not None:
+                errors.append(f"{document.document_id} v{document.version}: {exc}")
             log.error(
                 "could not delete an archived file",
                 extra={"path": str(path), "error": str(exc)},
@@ -88,6 +95,7 @@ def run(repo: ManifestRepo, config: Config, window: RetentionWindow) -> PurgeRep
     if not root.is_dir():
         return report
 
+    failed_dates = set()
     for entry in sorted(root.iterdir()):
         if not entry.is_dir() or entry.name in PROTECTED_NAMES:
             continue
@@ -113,13 +121,14 @@ def run(repo: ManifestRepo, config: Config, window: RetentionWindow) -> PurgeRep
                 extra={"dir": entry.name, "files": file_count},
             )
         except OSError as exc:
+            failed_dates.add(entry_date)
             report.errors.append(f"{entry.name}: {exc}")
             log.error(
                 "could not remove a date directory",
                 extra={"dir": entry.name, "error": str(exc)},
             )
 
-    report.rows_marked = repo.mark_purged(window.first)
+    report.rows_marked = repo.mark_purged(window.first, exclude_dates=failed_dates)
 
     # The inbox indexes follow the same retention as the documents they point at,
     # so that a stale index never links into a directory that no longer exists.
@@ -154,3 +163,7 @@ def _purge_inbox(config: Config, window: RetentionWindow, report: PurgeReport) -
             log.debug("purged an inbox index", extra={"file": entry.name})
         except OSError as exc:  # pragma: no cover
             report.errors.append(f"_inbox/{entry.name}: {exc}")
+            log.error(
+                "could not purge an inbox index",
+                extra={"file": entry.name, "error": str(exc)},
+            )

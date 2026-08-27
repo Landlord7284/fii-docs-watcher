@@ -78,6 +78,8 @@ def discover_entity(
     report.documents_seen += len(result.rows)
     report.invalid_rows += len(result.row_errors)
     for error in result.row_errors:
+        message = f"{scope.label}/{entity.fundosnet_id}: {error}"
+        report.errors.append(message)
         log.error(
             "listing row failed validation and was skipped",
             extra={"scope": scope.label, "fundosnet_id": entity.fundosnet_id, "error": str(error)},

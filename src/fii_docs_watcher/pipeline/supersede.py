@@ -152,8 +152,9 @@ def detect(repo: ManifestRepo, window: RetentionWindow) -> SupersedeReport:
 
     with transaction(repo.connection):
         for loser, winner in pairs:
+            changed = repo.mark_superseded_by(loser.identity, winner.identity)
             if loser.superseded_at is None:
-                report.detected += repo.mark_superseded_by(loser.identity, winner.identity)
+                report.detected += changed
                 log.info(
                     "a re-filing replaced an earlier publication",
                     extra={
@@ -163,6 +164,15 @@ def detect(repo: ManifestRepo, window: RetentionWindow) -> SupersedeReport:
                         "fundosnet_id": loser.fundosnet_id,
                         "category": loser.category,
                         "reference_date": loser.reference_date,
+                    },
+                )
+            elif changed:
+                log.info(
+                    "a newer re-filing replaced the previously recorded replacement",
+                    extra={
+                        "document_id": loser.document_id,
+                        "version": loser.version,
+                        "replaced_by": f"{winner.document_id} v{winner.version}",
                     },
                 )
             if loser.local_state in PENDING_STATES:
@@ -206,12 +216,15 @@ def sweep(repo: ManifestRepo, config: Config, window: RetentionWindow) -> Supers
     if not doomed:
         return report
 
-    removed = purge.remove_files(config, doomed)
+    removed = purge.remove_files(config, doomed, errors=report.errors)
     with transaction(repo.connection):
         repo.mark_superseded_removed(removed)
     report.files_removed = len(removed)
 
+    removed_set = set(removed)
     for document in doomed:
+        if document.identity not in removed_set:
+            continue
         log.info(
             "removed a superseded file",
             extra={

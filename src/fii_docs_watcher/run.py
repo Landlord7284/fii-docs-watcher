@@ -73,9 +73,17 @@ class RunReport:
     def exit_code(self) -> int:
         if self.errors or self.scopes_failed or self.interrupted:
             return ExitCode.PARTIAL
-        if self.discovery and (self.discovery.entities_failed or self.discovery.incomplete_scans):
+        if self.discovery and (
+            self.discovery.entities_failed
+            or self.discovery.incomplete_scans
+            or self.discovery.invalid_rows
+        ):
             return ExitCode.PARTIAL
         if self.downloads and self.downloads.failed:
+            return ExitCode.PARTIAL
+        if self.supersede and self.supersede.errors:
+            return ExitCode.PARTIAL
+        if self.purge and self.purge.errors:
             return ExitCode.PARTIAL
         return ExitCode.OK
 

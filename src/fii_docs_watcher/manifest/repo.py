@@ -222,10 +222,26 @@ class ManifestRepo:
         cursor = self.connection.execute(
             """
             UPDATE documents
-               SET superseded_at = ?, superseded_by_id = ?, superseded_by_version = ?
-             WHERE document_id = ? AND version = ? AND superseded_at IS NULL
+               SET superseded_at = COALESCE(superseded_at, ?),
+                   superseded_by_id = ?, superseded_by_version = ?
+             WHERE document_id = ? AND version = ?
+               AND (
+                    superseded_at IS NULL
+                    OR superseded_by_version IS NULL
+                    OR superseded_by_version < ?
+                    OR (superseded_by_version = ? AND superseded_by_id < ?)
+               )
             """,
-            (timestamp(), winner[0], winner[1], loser[0], loser[1]),
+            (
+                timestamp(),
+                winner[0],
+                winner[1],
+                loser[0],
+                loser[1],
+                winner[1],
+                winner[1],
+                winner[0],
+            ),
         )
         return cursor.rowcount
 
@@ -298,6 +314,24 @@ class ManifestRepo:
             (state.value, document_id, version),
         )
 
+    def set_download_target(
+        self, document_id: int, version: int, *, path: str, extension: str
+    ) -> None:
+        """Persist where validated bytes will be published before the atomic rename.
+
+        Filesystem and SQLite cannot commit together. Recording the destination
+        first lets startup reconciliation find a file when a crash lands between
+        the rename and `mark_available`.
+        """
+        self.connection.execute(
+            """
+            UPDATE documents
+               SET path = ?, extension = ?
+             WHERE document_id = ? AND version = ? AND local_state = ?
+            """,
+            (path, extension, document_id, version, LocalState.DOWNLOADING.value),
+        )
+
     def mark_available(
         self, document_id: int, version: int, *, path: str, extension: str, content_hash: str
     ) -> None:
@@ -367,15 +401,20 @@ class ManifestRepo:
             )
         ]
 
-    def mark_purged(self, before: date) -> int:
-        """Mark every document delivered before `before` as purged."""
+    def mark_purged(self, before: date, *, exclude_dates: Collection[date] = ()) -> int:
+        """Mark old documents purged, except dates whose filesystem removal failed."""
+        excluded = tuple(to_dir_name(value) for value in exclude_dates)
+        exclusion = (
+            f"AND delivery_date NOT IN ({','.join('?' * len(excluded))})" if excluded else ""
+        )
         cursor = self.connection.execute(
-            """
+            f"""
             UPDATE documents
                SET local_state = ?, purged_at = ?, path = NULL
              WHERE delivery_date < ? AND purged_at IS NULL
+               {exclusion}
             """,
-            (LocalState.PURGED.value, timestamp(), to_dir_name(before)),
+            (LocalState.PURGED.value, timestamp(), to_dir_name(before), *excluded),
         )
         return cursor.rowcount
 

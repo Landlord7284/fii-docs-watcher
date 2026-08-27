@@ -108,7 +108,8 @@ def run(
                 fund_type=fund_type,
             )
         except (TransientSourceError, WatcherError) as exc:
-            report.error = str(exc)
+            message = f"tipoFundo={fund_type}: {exc}"
+            report.error = f"{report.error}; {message}" if report.error else message
             log.warning(
                 "a global audit scan failed; this does not affect the archive",
                 extra={"error": str(exc), "fund_type": fund_type},

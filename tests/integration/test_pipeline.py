@@ -15,14 +15,14 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from conftest import SAMPLE_PDF, FakeFnet, make_row, write_funds_yaml
+from conftest import SAMPLE_PDF, SAMPLE_XML, FakeFnet, make_row, write_funds_yaml
 from fii_docs_watcher.clock import to_dir_name, today
 from fii_docs_watcher.config import Config
 from fii_docs_watcher.fnet.client import FnetClient
 from fii_docs_watcher.manifest.db import connect
 from fii_docs_watcher.manifest.repo import LocalState, ManifestRepo
-from fii_docs_watcher.pipeline import discover, fetch, inbox, purge, reconcile, supersede
-from fii_docs_watcher.run import prepare_roots
+from fii_docs_watcher.pipeline import discover, fetch, inbox, naming, purge, reconcile, supersede
+from fii_docs_watcher.run import ExitCode, RunReport, prepare_roots
 from fii_docs_watcher.scope.yaml_store import FundsFile
 
 CNPJ = "08431747000106"
@@ -671,17 +671,25 @@ class TestReconciliation:
 
         window = retention_window(config.retention.days)
         fake.add_documents(FUND_ID, [make_row(1001)])
-        _cycle(config, repo, scopes, client, window)
+        discover.run(client, repo, scopes, window, page_length=200)
 
-        stored = repo.get(1001, 1)
-        assert stored is not None
-
-        # Simulate the crash: the file is in place, the manifest is not.
-        repo.connection.execute(
-            "UPDATE documents SET local_state = ?, content_hash = NULL, downloaded_at = NULL "
-            "WHERE document_id = 1001",
-            (LocalState.DOWNLOADING.value,),
+        # Simulate a fresh download that crashed after rename but before
+        # mark_available: the intended path was persisted, but no successful
+        # download state or hash has ever existed.
+        filename = naming.document_filename(
+            prefix="HGBS11",
+            category="Informes Periódicos",
+            species="",
+            document_id=1001,
+            version=1,
+            extension="xml",
         )
+        relative = f"{to_dir_name(today())}/{filename}"
+        repo.set_state(1001, 1, LocalState.DOWNLOADING)
+        repo.set_download_target(1001, 1, path=relative, extension="xml")
+        target = config.paths.documents_root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(SAMPLE_XML)
 
         report = reconcile.run(repo, config)
         assert report.promoted == 1
@@ -690,7 +698,8 @@ class TestReconciliation:
         healed = repo.get(1001, 1)
         assert healed is not None
         assert healed.local_state == LocalState.AVAILABLE
-        assert healed.content_hash == stored.content_hash
+        assert healed.path == relative
+        assert healed.content_hash is not None
 
     def test_a_missing_destination_goes_back_to_the_queue(self, env) -> None:
         config, fake, repo, scopes, client = env
@@ -778,6 +787,31 @@ class TestRetention:
         assert repo.get(1002, 1).local_state == LocalState.PURGED
         assert repo.get(1002, 1).purged_at is not None
 
+    def test_a_date_whose_directory_could_not_be_removed_is_not_marked_purged(
+        self, env, monkeypatch
+    ) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        old = today() - timedelta(days=10)
+        fake.add_documents(FUND_ID, [make_row(1002, delivery=old)])
+        _cycle(config, repo, scopes, client, retention_window(30))
+        old_dir = config.paths.documents_root / to_dir_name(old)
+
+        monkeypatch.setattr(
+            purge.shutil,
+            "rmtree",
+            lambda _path: (_ for _ in ()).throw(OSError("share is read-only")),
+        )
+        report = purge.run(repo, config, retention_window(7))
+
+        stored = repo.get(1002, 1)
+        assert report.errors
+        assert report.rows_marked == 0
+        assert stored.local_state == LocalState.AVAILABLE
+        assert stored.path is not None
+        assert old_dir.is_dir()
+
     def test_purge_never_touches_directories_it_does_not_recognise(self, env) -> None:
         config, fake, repo, scopes, client = env
         from fii_docs_watcher.clock import retention_window
@@ -837,6 +871,30 @@ class TestInbox:
             assert to_dir_name(today() - timedelta(days=offset)) in text
         # Relative links, so the archive stays portable over SMB.
         assert "](../" in text
+
+    def test_a_failed_index_publication_keeps_the_previous_complete_file(
+        self, env, monkeypatch
+    ) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        window = retention_window(7)
+        initial = inbox.run(repo, config, window)
+        path = config.paths.documents_root / initial.path
+        previous = path.read_bytes()
+        original_replace = Path.replace
+
+        def fail_index_replace(source: Path, target: Path):
+            if source.name == f".{path.name}.tmp":
+                raise OSError("interrupted publication")
+            return original_replace(source, target)
+
+        monkeypatch.setattr(Path, "replace", fail_index_replace)
+        with pytest.raises(OSError, match="interrupted publication"):
+            inbox.run(repo, config, window)
+
+        assert path.read_bytes() == previous
+        assert not path.with_name(f".{path.name}.tmp").exists()
 
     def test_an_empty_day_says_so_rather_than_looking_broken(self, env) -> None:
         config, fake, repo, scopes, client = env
@@ -909,6 +967,76 @@ class TestSupersession:
         assert old.superseded_at is not None
         assert old.local_state == LocalState.AVAILABLE
         assert (config.paths.documents_root / old.path).is_file()
+
+    def test_a_later_replacement_redirects_a_previous_failed_supersession(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        window = retention_window(config.retention.days)
+        fake.add_documents(FUND_ID, [make_row(1295651, category="Relatórios")])
+        _pdf(fake, 1295651, 1)
+        _cycle(config, repo, scopes, client, window)
+
+        fake.documents[FUND_ID].append(
+            make_row(1295810, version=2, category="Relatórios", modality="RE")
+        )
+        fake.fail_downloads.add(1295810)
+        _cycle(config, repo, scopes, client, window)
+        assert repo.get(1295651, 1).superseded_by == (1295810, 2)
+
+        fake.documents[FUND_ID].append(
+            make_row(1295900, version=3, category="Relatórios", modality="RE")
+        )
+        _pdf(fake, 1295900, 3)
+        _cycle(config, repo, scopes, client, window)
+
+        original = repo.get(1295651, 1)
+        newest = repo.get(1295900, 3)
+        assert original.superseded_by == (1295900, 3)
+        assert original.local_state == LocalState.SUPERSEDED
+        assert original.path is None
+        assert newest.local_state == LocalState.AVAILABLE
+        assert {path.name for path in config.paths.documents_root.rglob("*.pdf")} == {
+            "HGBS11_Relatorios_1295900_V03.pdf"
+        }
+
+    def test_a_failed_superseded_file_removal_is_reported_and_not_logged_as_removed(
+        self, env, monkeypatch, caplog
+    ) -> None:
+        import logging
+
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        window = retention_window(config.retention.days)
+        fake.add_documents(FUND_ID, [make_row(1295651, category="Relatórios")])
+        _pdf(fake, 1295651, 1)
+        _cycle(config, repo, scopes, client, window)
+        fake.documents[FUND_ID].append(
+            make_row(1295810, version=2, category="Relatórios", modality="RE")
+        )
+        _pdf(fake, 1295810, 2)
+        discover.run(client, repo, scopes, window, page_length=200)
+        supersede.detect(repo, window)
+        fetch.run(client, repo, config, scopes)
+
+        original_unlink = Path.unlink
+
+        def fail_original(path: Path, *args, **kwargs):
+            if "1295651" in path.name:
+                raise OSError("share is read-only")
+            return original_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", fail_original)
+        with caplog.at_level(logging.INFO):
+            report = supersede.sweep(repo, config, window)
+
+        assert report.files_removed == 0
+        assert report.errors
+        assert repo.get(1295651, 1).local_state == LocalState.AVAILABLE
+        assert not any(
+            record.message == "removed a superseded file" for record in caplog.records
+        )
 
     def test_a_replaced_document_is_never_downloaded_in_the_first_place(self, env) -> None:
         config, fake, repo, scopes, client = env
@@ -1041,6 +1169,19 @@ class TestInboxAndSupersession:
 
 
 class TestFailureIsolation:
+    def test_invalid_listing_rows_are_visible_in_the_report_and_exit_status(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        fake.add_documents(FUND_ID, [make_row(1001, fund="")])
+        discovery_report = discover.run(
+            client, repo, scopes, retention_window(7), page_length=200
+        )
+
+        assert discovery_report.invalid_rows == 1
+        assert discovery_report.errors
+        assert RunReport(discovery=discovery_report).exit_code == ExitCode.PARTIAL
+
     def test_a_failing_download_does_not_stop_the_others(self, env) -> None:
         config, fake, repo, scopes, client = env
         from fii_docs_watcher.clock import retention_window
@@ -1056,6 +1197,44 @@ class TestFailureIsolation:
         assert repo.get(1002, 1).local_state == LocalState.FAILED
         # The failure is recorded as history, not overwritten on the document row.
         assert repo.attempt_count(1002, 1) >= 1
+
+    def test_a_filesystem_failure_is_recorded_as_an_attempt(self, env, monkeypatch) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        fake.add_documents(FUND_ID, [make_row(1001)])
+        discover.run(client, repo, scopes, retention_window(7), page_length=200)
+        original_write = Path.write_bytes
+
+        def fail_part(path: Path, data: bytes) -> int:
+            if path.suffix == ".part":
+                raise OSError("disk full")
+            return original_write(path, data)
+
+        monkeypatch.setattr(Path, "write_bytes", fail_part)
+        report = fetch.run(client, repo, config, scopes)
+
+        assert report.failed == 1
+        assert report.errors
+        assert repo.attempt_count(1001, 1) == 1
+        assert repo.get(1001, 1).local_state == LocalState.FAILED
+
+    def test_an_exhausted_attempt_budget_remains_a_reported_failure(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        fake.add_documents(FUND_ID, [make_row(1001)])
+        fake.fail_downloads.add(1001)
+        discover.run(client, repo, scopes, retention_window(7), page_length=200)
+        for _ in range(fetch.MAX_ATTEMPTS_PER_DOCUMENT):
+            assert fetch.run(client, repo, config, scopes).failed == 1
+
+        requests_before = len(fake.request_log)
+        report = fetch.run(client, repo, config, scopes)
+
+        assert report.failed == 1
+        assert "exhausted" in report.errors[0]
+        assert len(fake.request_log) == requests_before
 
     def test_a_failed_document_is_retried_on_the_next_run(self, env) -> None:
         config, fake, repo, scopes, client = env

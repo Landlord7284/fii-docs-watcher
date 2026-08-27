@@ -22,10 +22,12 @@ so an entry never disappears from an index without an explanation.
 from __future__ import annotations
 
 import logging
+import os
 from collections import defaultdict
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import date, timedelta
+from pathlib import Path
 from urllib.parse import quote
 
 from ..clock import RetentionWindow, timestamp, to_dir_name, today
@@ -42,6 +44,24 @@ class InboxReport:
     superseded: int = 0
     files_written: int = 0
     written: bool = False
+
+
+def _write_atomic(path: Path, content: str, mode: int) -> None:
+    """Publish one generated index without exposing a partial final file."""
+    temporary = path.with_name(f".{path.name}.tmp")
+    data = content.encode("utf-8")
+    fd = os.open(temporary, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, mode)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        with suppress(OSError):
+            temporary.chmod(mode)
+        temporary.replace(path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 def _link(document: ManifestDocument) -> str:
@@ -166,11 +186,11 @@ def run(repo: ManifestRepo, config: Config, window: RetentionWindow) -> InboxRep
             continue
 
         documents, superseded = _for_day(repo, day, window)
-        path.write_text(
-            render(documents, superseded, for_date=day, window=window), encoding="utf-8"
+        _write_atomic(
+            path,
+            render(documents, superseded, for_date=day, window=window),
+            config.files.file_mode,
         )
-        with suppress(OSError):
-            path.chmod(config.files.file_mode)
         report.files_written += 1
 
         if day == for_date:

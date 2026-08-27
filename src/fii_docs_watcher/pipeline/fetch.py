@@ -29,6 +29,7 @@ import os
 import time
 from contextlib import suppress
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 
 from ..clock import parse_dir_name, to_dir_name
@@ -40,6 +41,7 @@ from ..errors import (
     WatcherError,
 )
 from ..fnet.client import FnetClient
+from ..fnet.download import DownloadedDocument
 from ..fnet.download import fetch as fetch_document
 from ..fnet.schema import looks_structured
 from ..manifest.repo import AttemptOutcome, LocalState, ManifestDocument, ManifestRepo
@@ -149,6 +151,106 @@ def _check_cnpj(
     raise CnpjDivergenceError(message, context={"document_id": document.document_id})
 
 
+def _record_failure(
+    repo: ManifestRepo,
+    document: ManifestDocument,
+    report: FetchReport,
+    *,
+    outcome: AttemptOutcome,
+    error: Exception | str,
+    started: float | None = None,
+    size: int | None = None,
+) -> None:
+    """Apply the common manifest, attempt-history and report failure updates."""
+    duration_ms = int((time.monotonic() - started) * 1000) if started is not None else None
+    repo.record_attempt(
+        document.document_id,
+        document.version,
+        outcome=outcome,
+        size=size,
+        duration_ms=duration_ms,
+        error=str(error),
+    )
+    repo.mark_failed(document.document_id, document.version)
+    report.failed += 1
+    report.errors.append(f"document {document.document_id}: {error}")
+
+
+def _publish(
+    repo: ManifestRepo,
+    config: Config,
+    document: ManifestDocument,
+    downloaded: DownloadedDocument,
+    scope: Scope | None,
+    delivery: date,
+    report: FetchReport,
+    started: float,
+) -> None:
+    """Publish validated bytes atomically and commit their manifest state."""
+    entity_cnpj = downloaded.served.cnpj or document.entity_cnpj
+    prefix = naming.entity_prefix(
+        ticker=getattr(scope, "ticker", None),
+        fund_description=document.fund_description or "",
+        cnpj=entity_cnpj,
+    )
+    filename = naming.document_filename(
+        prefix=prefix,
+        category=document.category or "",
+        species=document.species or "",
+        document_id=document.document_id,
+        version=document.version,
+        extension=downloaded.extension,
+    )
+
+    target_dir = config.paths.documents_root / to_dir_name(delivery)
+    _ensure_dir(target_dir, config.files.directory_mode)
+    _ensure_dir(config.paths.tmp_dir, config.files.directory_mode)
+
+    part_path = config.paths.tmp_dir / naming.part_filename(document.document_id, document.version)
+    final_path = target_dir / filename
+    relative_path = str(final_path.relative_to(config.paths.documents_root))
+
+    # Persist the intended destination before publication. If the process dies
+    # after the rename, startup reconciliation can now locate and adopt the file.
+    repo.set_download_target(
+        document.document_id,
+        document.version,
+        path=relative_path,
+        extension=downloaded.extension,
+    )
+    part_path.write_bytes(downloaded.content)
+    with suppress(OSError):
+        os.chmod(part_path, config.files.file_mode)
+    part_path.replace(final_path)
+
+    repo.mark_available(
+        document.document_id,
+        document.version,
+        path=relative_path,
+        extension=downloaded.extension,
+        content_hash=downloaded.content_hash,
+    )
+    repo.record_attempt(
+        document.document_id,
+        document.version,
+        outcome=AttemptOutcome.SUCCESS,
+        size=downloaded.size,
+        duration_ms=int((time.monotonic() - started) * 1000),
+    )
+
+    report.downloaded += 1
+    report.bytes_written += downloaded.size
+    log.info(
+        "document filed",
+        extra={
+            "document_id": document.document_id,
+            "version": document.version,
+            "path": relative_path,
+            "bytes": downloaded.size,
+        },
+    )
+
+
 def fetch_one(
     client: FnetClient,
     repo: ManifestRepo,
@@ -160,15 +262,25 @@ def fetch_one(
     """Download and file one document. Returns True when it lands on disk."""
     delivery = parse_dir_name(document.delivery_date)
     if delivery is None:
+        message = f"document has an unusable delivery date: {document.delivery_date!r}"
+        _record_failure(
+            repo,
+            document,
+            report,
+            outcome=AttemptOutcome.ERROR,
+            error=message,
+        )
         log.error(
             "document has an unusable delivery date and cannot be filed",
             extra={"document_id": document.document_id, "value": document.delivery_date},
         )
-        repo.mark_failed(document.document_id, document.version)
         return False
 
     if repo.attempt_count(document.document_id, document.version) >= MAX_ATTEMPTS_PER_DOCUMENT:
-        log.debug(
+        message = f"exhausted the {MAX_ATTEMPTS_PER_DOCUMENT}-attempt download budget"
+        report.failed += 1
+        report.errors.append(f"document {document.document_id}: {message}")
+        log.error(
             "document has exhausted its attempt budget; leaving it failed",
             extra={"document_id": document.document_id, "version": document.version},
         )
@@ -190,34 +302,28 @@ def fetch_one(
             expect_structured=expect_structured,
         )
     except ContentValidationError as exc:
-        duration = int((time.monotonic() - started) * 1000)
-        repo.record_attempt(
-            document.document_id,
-            document.version,
+        _record_failure(
+            repo,
+            document,
+            report,
             outcome=AttemptOutcome.INVALID_CONTENT,
-            duration_ms=duration,
             error=str(exc),
+            started=started,
         )
-        repo.mark_failed(document.document_id, document.version)
-        report.failed += 1
-        report.errors.append(f"document {document.document_id}: {exc}")
         log.error(
             "downloaded content failed validation and was not written",
             extra={"document_id": document.document_id, "error": str(exc)},
         )
         return False
     except (TransientSourceError, WatcherError) as exc:
-        duration = int((time.monotonic() - started) * 1000)
-        repo.record_attempt(
-            document.document_id,
-            document.version,
+        _record_failure(
+            repo,
+            document,
+            report,
             outcome=AttemptOutcome.TRANSIENT,
-            duration_ms=duration,
             error=str(exc),
+            started=started,
         )
-        repo.mark_failed(document.document_id, document.version)
-        report.failed += 1
-        report.errors.append(f"document {document.document_id}: {exc}")
         log.warning(
             "download failed; it will be retried on a later run",
             extra={"document_id": document.document_id, "error": str(exc)},
@@ -228,15 +334,15 @@ def fetch_one(
         try:
             _check_cnpj(scope, entity, document, downloaded.served.cnpj, report)
         except CnpjDivergenceError as exc:
-            repo.record_attempt(
-                document.document_id,
-                document.version,
+            _record_failure(
+                repo,
+                document,
+                report,
                 outcome=AttemptOutcome.ERROR,
                 size=downloaded.size,
                 error=str(exc),
+                started=started,
             )
-            repo.mark_failed(document.document_id, document.version)
-            report.failed += 1
             log.critical(
                 "CNPJ divergence: the document was not filed and the resolution is not confirmed",
                 extra={"document_id": document.document_id, "error": str(exc)},
@@ -270,66 +376,23 @@ def fetch_one(
         )
         return False
 
-    # The entity CNPJ from the served filename is the only place it appears, so
-    # prefer it over the one that originated the query when it parsed cleanly.
-    entity_cnpj = downloaded.served.cnpj or document.entity_cnpj
-
-    prefix = naming.entity_prefix(
-        ticker=getattr(scope, "ticker", None),
-        fund_description=document.fund_description or "",
-        cnpj=entity_cnpj,
-    )
-    filename = naming.document_filename(
-        prefix=prefix,
-        category=document.category or "",
-        species=document.species or "",
-        document_id=document.document_id,
-        version=document.version,
-        extension=downloaded.extension,
-    )
-
-    target_dir = config.paths.documents_root / to_dir_name(delivery)
-    _ensure_dir(target_dir, config.files.directory_mode)
-    _ensure_dir(config.paths.tmp_dir, config.files.directory_mode)
-
-    part_path = config.paths.tmp_dir / naming.part_filename(document.document_id, document.version)
-    final_path = target_dir / filename
-
-    part_path.write_bytes(downloaded.content)
-    # Set the mode before the rename, so the file is never briefly visible in
-    # the archive with the wrong permissions.
-    with suppress(OSError):
-        os.chmod(part_path, config.files.file_mode)
-
-    # Atomic within the documents root, which is why .tmp lives there.
-    part_path.replace(final_path)
-
-    repo.mark_available(
-        document.document_id,
-        document.version,
-        path=str(final_path.relative_to(config.paths.documents_root)),
-        extension=downloaded.extension,
-        content_hash=downloaded.content_hash,
-    )
-    repo.record_attempt(
-        document.document_id,
-        document.version,
-        outcome=AttemptOutcome.SUCCESS,
-        size=downloaded.size,
-        duration_ms=int((time.monotonic() - started) * 1000),
-    )
-
-    report.downloaded += 1
-    report.bytes_written += downloaded.size
-    log.info(
-        "document filed",
-        extra={
-            "document_id": document.document_id,
-            "version": document.version,
-            "path": str(final_path.relative_to(config.paths.documents_root)),
-            "bytes": downloaded.size,
-        },
-    )
+    try:
+        _publish(repo, config, document, downloaded, scope, delivery, report, started)
+    except OSError as exc:
+        _record_failure(
+            repo,
+            document,
+            report,
+            outcome=AttemptOutcome.ERROR,
+            error=exc,
+            started=started,
+            size=downloaded.size,
+        )
+        log.error(
+            "could not write a document to the archive",
+            extra={"document_id": document.document_id, "error": str(exc)},
+        )
+        return False
     return True
 
 
@@ -448,17 +511,6 @@ def run(
                 },
             )
             break
-        try:
-            fetch_one(client, repo, config, document, index, report)
-        except OSError as exc:
-            # Disk full, permissions, a vanished mount: real, and not the
-            # document's fault. Record and continue.
-            report.failed += 1
-            report.errors.append(f"document {document.document_id}: {exc}")
-            log.error(
-                "could not write a document to the archive",
-                extra={"document_id": document.document_id, "error": str(exc)},
-            )
-            repo.mark_failed(document.document_id, document.version)
+        fetch_one(client, repo, config, document, index, report)
 
     return report

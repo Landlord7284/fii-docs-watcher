@@ -169,6 +169,11 @@ class TestValidation:
         with pytest.raises(ConfigError, match="max_response_bytes"):
             load()
 
+    def test_zero_source_response_limit_is_rejected(self, isolated: Path) -> None:
+        (isolated / "config.toml").write_text("[source]\nmax_response_bytes = 0\n")
+        with pytest.raises(ConfigError, match="max_response_bytes"):
+            load()
+
     def test_the_two_roots_may_not_be_the_same_or_nested(self, isolated: Path) -> None:
         # The documents root is meant to be shared and the data root must not be.
         (isolated / "config.toml").write_text(

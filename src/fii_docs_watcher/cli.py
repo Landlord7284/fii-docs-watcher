@@ -549,7 +549,7 @@ def _list_rows(scopes: list[Scope]) -> list[dict[str, str]]:
             entity_cells = {
                 "cnpj": format_masked(entity.cnpj) or entity.cnpj,
                 # Whether a downloaded file has proved this entity's CNPJ, not
-                # how the fund was registered -- see `fetch._check_cnpj`.
+                # how the fund was registered -- see `fetch._validate_and_confirm_cnpj`.
                 "confirmed": "yes" if entity.cnpj_confirmed else "not yet",
                 "fnet_id": str(entity.fundosnet_id),
                 "fnet_type": str(entity.fnet_fund_type),

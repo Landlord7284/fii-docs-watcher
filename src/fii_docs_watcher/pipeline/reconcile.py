@@ -55,11 +55,26 @@ def run(repo: ManifestRepo, config: Config) -> ReconcileReport:
 
         if path is not None and path.is_file():
             try:
-                content = path.read_bytes()
+                with path.open("rb") as handle:
+                    content = handle.read(config.source.max_response_bytes + 1)
             except OSError as exc:
                 log.error(
                     "could not read a file left by a previous run; requeueing the download",
                     extra={"document_id": document.document_id, "error": str(exc)},
+                )
+                repo.set_state(document.document_id, document.version, LocalState.DISCOVERED)
+                report.requeued += 1
+                continue
+
+            if len(content) > config.source.max_response_bytes:
+                log.error(
+                    "a file left by a previous run exceeds the configured size limit; "
+                    "requeueing the download",
+                    extra={
+                        "document_id": document.document_id,
+                        "path": str(path),
+                        "limit": config.source.max_response_bytes,
+                    },
                 )
                 repo.set_state(document.document_id, document.version, LocalState.DISCOVERED)
                 report.requeued += 1

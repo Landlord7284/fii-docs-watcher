@@ -90,9 +90,10 @@ def _entry(document: ManifestDocument, *, always_version: bool = False) -> str:
     """
     reference = f" · ref. {document.reference_date}" if document.reference_date else ""
     version = f" · v{document.version}" if always_version or document.version > 1 else ""
+    normalized_status = document.status.casefold().strip() if document.status else ""
     status = (
         f" · **{document.status}**"
-        if document.status and "ativo" not in document.status.lower()
+        if document.status and not normalized_status.startswith("ativo")
         else ""
     )
     return f"{_describe(document)}{reference}{version}{status}"

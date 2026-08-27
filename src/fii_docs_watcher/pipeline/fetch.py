@@ -79,9 +79,36 @@ class EntityIndex:
 
     def __init__(self, scopes: list[Scope]) -> None:
         self._by_id: dict[int, tuple[Scope, Entity]] = {}
+        self.conflicted_ids: set[int] = set()
+        self.errors: list[str] = []
         for scope in scopes:
             for entity in scope.entities:
-                self._by_id[entity.fundosnet_id] = (scope, entity)
+                fundosnet_id = entity.fundosnet_id
+                if fundosnet_id in self.conflicted_ids:
+                    continue
+                existing = self._by_id.get(fundosnet_id)
+                if existing is None:
+                    self._by_id[fundosnet_id] = (scope, entity)
+                    continue
+
+                existing_scope, existing_entity = existing
+                message = (
+                    f"Fundos.NET id {fundosnet_id} appears in multiple scopes "
+                    f"{existing_scope.label!r} and {scope.label!r}; its documents were deferred"
+                )
+                self.errors.append(message)
+                self.conflicted_ids.add(fundosnet_id)
+                self._by_id.pop(fundosnet_id)
+                log.error(
+                    "one Fundos.NET id appears in multiple configured scopes",
+                    extra={
+                        "fundosnet_id": fundosnet_id,
+                        "first_scope": existing_scope.label,
+                        "first_cnpj": existing_entity.normalized_cnpj,
+                        "other_scope": scope.label,
+                        "other_cnpj": entity.normalized_cnpj,
+                    },
+                )
 
     def get(self, fundosnet_id: int) -> tuple[Scope, Entity] | None:
         return self._by_id.get(fundosnet_id)
@@ -95,12 +122,11 @@ def _ensure_dir(path: Path, mode: int) -> None:
         log.debug("could not set directory mode", extra={"dir": str(path)})
 
 
-def _check_cnpj(
+def _validate_and_confirm_cnpj(
     scope: Scope,
     entity: Entity,
     document: ManifestDocument,
     served_cnpj: str | None,
-    report: FetchReport,
 ) -> None:
     """Close the loop on a resolution that was made by matching text.
 
@@ -149,7 +175,6 @@ def _check_cnpj(
         f"{format_masked(served_cnpj)}, which matches no entity of this scope "
         f"(expected {format_masked(expected)})"
     )
-    report.cnpj_divergences.append(message)
     raise CnpjDivergenceError(message, context={"document_id": document.document_id})
 
 
@@ -334,8 +359,9 @@ def fetch_one(
 
     if scope is not None and entity is not None:
         try:
-            _check_cnpj(scope, entity, document, downloaded.served.cnpj, report)
+            _validate_and_confirm_cnpj(scope, entity, document, downloaded.served.cnpj)
         except CnpjDivergenceError as exc:
+            report.cnpj_divergences.append(str(exc))
             _record_failure(
                 repo,
                 document,
@@ -451,6 +477,7 @@ def run(
     """Download every document still pending. Isolated failures never stop the batch."""
     report = FetchReport()
     index = EntityIndex(scopes)
+    report.errors.extend(index.errors)
 
     # A document whose entity is not among the scopes handed to this run is
     # deferred, not fetched. Two reasons, and the second is the important one:
@@ -466,8 +493,11 @@ def run(
     known, orphaned = _partition_by_entity(repo.pending_downloads(), index)
     if orphaned:
         report.deferred = len(orphaned)
+        report.failed += sum(
+            document.fundosnet_id in index.conflicted_ids for document in orphaned
+        )
         log.info(
-            "documents deferred: their fund is not in the current watch list",
+            "documents deferred: their entity is absent or ambiguous in the current watch list",
             extra={
                 "deferred": len(orphaned),
                 "entities": sorted({d.fundosnet_id for d in orphaned}),
@@ -503,13 +533,13 @@ def run(
         "starting downloads",
         extra={"pending": len(wanted), "skipped_by_format": report.skipped},
     )
-    for document in wanted:
+    for position, document in enumerate(wanted):
         if callable(should_stop) and should_stop():
             log.warning(
                 "stopping downloads early on request",
                 extra={
                     "downloaded": report.downloaded,
-                    "remaining": len(wanted) - report.downloaded,
+                    "remaining": len(wanted) - position,
                 },
             )
             break

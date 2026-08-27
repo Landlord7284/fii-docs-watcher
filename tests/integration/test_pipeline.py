@@ -8,6 +8,7 @@ rename and the commit, the retention frontier, and the CNPJ check.
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 
@@ -23,6 +24,7 @@ from fii_docs_watcher.manifest.db import connect
 from fii_docs_watcher.manifest.repo import LocalState, ManifestRepo
 from fii_docs_watcher.pipeline import discover, fetch, inbox, naming, purge, reconcile, supersede
 from fii_docs_watcher.run import ExitCode, RunReport, prepare_roots
+from fii_docs_watcher.scope.models import Entity, Scope
 from fii_docs_watcher.scope.yaml_store import FundsFile
 
 CNPJ = "08431747000106"
@@ -745,6 +747,42 @@ class TestReconciliation:
         assert report.promoted == 0
         assert report.requeued == 1
 
+    def test_an_oversized_archived_file_is_read_only_up_to_the_source_limit(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        fake.add_documents(FUND_ID, [make_row(1001)])
+        discover.run(client, repo, scopes, retention_window(7), page_length=200)
+        relative = f"{to_dir_name(today())}/oversized.xml"
+        target = config.paths.documents_root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"x" * 11)
+        repo.set_state(1001, 1, LocalState.DOWNLOADING)
+        repo.set_download_target(1001, 1, path=relative, extension="xml")
+        limited = replace(config, source=replace(config.source, max_response_bytes=10))
+
+        report = reconcile.run(repo, limited)
+
+        assert report.promoted == 0
+        assert report.requeued == 1
+        assert repo.get(1001, 1).local_state == LocalState.DISCOVERED
+
+    def test_a_changed_valid_file_reports_its_hash_mismatch(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        fake.add_documents(FUND_ID, [make_row(1001)])
+        _cycle(config, repo, scopes, client, retention_window(7))
+        stored = repo.get(1001, 1)
+        original_hash = stored.content_hash
+        (config.paths.documents_root / stored.path).write_bytes(SAMPLE_XML + b"\n")
+        repo.set_state(1001, 1, LocalState.DOWNLOADING)
+
+        report = reconcile.run(repo, config)
+
+        assert len(report.hash_mismatches) == 1
+        assert repo.get(1001, 1).content_hash != original_hash
+
     def test_stale_staging_files_are_swept(self, config: Config) -> None:
         import os
         import time
@@ -903,6 +941,26 @@ class TestInbox:
         report = inbox.run(repo, config, retention_window(7))
         text = (config.paths.documents_root / report.path).read_text(encoding="utf-8")
         assert "Nothing new arrived today" in text
+
+    def test_inactive_status_is_not_mistaken_for_active(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        window = retention_window(7)
+        fake.add_documents(
+            FUND_ID,
+            [
+                make_row(1001, status="Inativo"),
+                make_row(1002, status="Ativo com visualização"),
+            ],
+        )
+        _cycle(config, repo, scopes, client, window)
+
+        report = inbox.run(repo, config, window)
+        text = (config.paths.documents_root / report.path).read_text(encoding="utf-8")
+
+        assert "**Inativo**" in text
+        assert "Ativo com visualização" not in text
 
 
 def _pdf(fake, document_id: int, version: int) -> None:
@@ -1197,6 +1255,47 @@ class TestFailureIsolation:
         assert repo.get(1002, 1).local_state == LocalState.FAILED
         # The failure is recorded as history, not overwritten on the document row.
         assert repo.attempt_count(1002, 1) >= 1
+
+    def test_conflicting_scope_owners_defer_the_document_without_requesting_it(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        fake.add_documents(FUND_ID, [make_row(1001)])
+        discover.run(client, repo, scopes, retention_window(7), page_length=200)
+        conflicting = Scope(
+            cnpj="99999999000199",
+            ticker="OTHER11",
+            entities=[Entity(cnpj="99999999000199", fundosnet_id=FUND_ID)],
+        )
+        requests_before = len(fake.request_log)
+
+        report = fetch.run(client, repo, config, [scopes[0], conflicting])
+
+        assert report.deferred == 1
+        assert report.failed == 1
+        assert report.errors
+        assert RunReport(downloads=report).exit_code == ExitCode.PARTIAL
+        assert len(fake.request_log) == requests_before
+        assert repo.get(1001, 1).local_state == LocalState.DISCOVERED
+
+    def test_interrupted_download_log_counts_only_unprocessed_documents(
+        self, env, caplog
+    ) -> None:
+        import logging
+
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        fake.add_documents(FUND_ID, [make_row(1001), make_row(1002)])
+        fake.fail_downloads.add(1001)
+        discover.run(client, repo, scopes, retention_window(7), page_length=200)
+        stop_answers = iter((False, True))
+
+        with caplog.at_level(logging.WARNING):
+            fetch.run(client, repo, config, scopes, should_stop=lambda: next(stop_answers))
+
+        stopped = next(record for record in caplog.records if record.msg.startswith("stopping"))
+        assert stopped.remaining == 1
 
     def test_a_filesystem_failure_is_recorded_as_an_attempt(self, env, monkeypatch) -> None:
         config, fake, repo, scopes, client = env

@@ -384,6 +384,8 @@ def _validate(config: Config) -> None:
         raise ConfigError(f"[logging].format must be text or json, got {config.logging.format!r}")
     if config.source.max_retries < 0:
         raise ConfigError("[source].max_retries must be >= 0")
+    if config.source.max_response_bytes < 1:
+        raise ConfigError("[source].max_response_bytes must be >= 1")
     if config.cvm.max_response_bytes < 1:
         raise ConfigError("[cvm].max_response_bytes must be >= 1")
 

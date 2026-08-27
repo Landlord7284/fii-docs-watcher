@@ -83,10 +83,12 @@ class TestDiscoveryAndDownload:
         window = retention_window(config.retention.days)
         fake.add_documents(FUND_ID, [make_row(1001), make_row(1002)])
 
-        _, first = _cycle(config, repo, scopes, client, window)
+        first_discovery, first = _cycle(config, repo, scopes, client, window)
+        assert first_discovery.documents_new == 2
         assert first.downloaded == 2
 
-        _, second = _cycle(config, repo, scopes, client, window)
+        second_discovery, second = _cycle(config, repo, scopes, client, window)
+        assert second_discovery.documents_new == 0
         assert second.downloaded == 0
         assert repo.counts_by_state() == {LocalState.AVAILABLE.value: 2}
 
@@ -349,6 +351,38 @@ class TestFormatFilter:
         assert list(config.paths.documents_root.rglob("*.pdf")) == []
         # The request really happened, so it is recorded rather than pretended away.
         assert repo.attempt_count(7100, 1) == 1
+
+    def test_filtered_attempts_do_not_exhaust_the_failure_budget(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        fake.add_documents(
+            FUND_ID,
+            [
+                make_row(
+                    7100,
+                    category="Informes Periódicos",
+                    doc_type="Informe Mensal Estruturado ",
+                )
+            ],
+        )
+        fake.payloads[7100] = SAMPLE_PDF
+        fake.content_type[7100] = "application/pdf"
+        xml_only = replace(config, download=replace(config.download, formats=("xml",)))
+        discover.run(client, repo, scopes, retention_window(7), page_length=200)
+
+        for _ in range(fetch.MAX_ATTEMPTS_PER_DOCUMENT):
+            report = fetch.run(client, repo, xml_only, scopes)
+            assert report.skipped == 1
+
+        assert repo.attempt_count(7100, 1) == fetch.MAX_ATTEMPTS_PER_DOCUMENT
+        assert repo.failure_attempt_count(7100, 1) == 0
+
+        both_formats = replace(config, download=replace(config.download, formats=("pdf", "xml")))
+        report = fetch.run(client, repo, both_formats, scopes)
+
+        assert report.downloaded == 1
+        assert repo.get(7100, 1).local_state == LocalState.AVAILABLE
 
     def test_both_formats_is_the_default_and_changes_nothing(self, env) -> None:
         config, fake, repo, scopes, client = env

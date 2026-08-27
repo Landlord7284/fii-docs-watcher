@@ -303,7 +303,10 @@ def fetch_one(
         )
         return False
 
-    if repo.attempt_count(document.document_id, document.version) >= MAX_ATTEMPTS_PER_DOCUMENT:
+    if (
+        repo.failure_attempt_count(document.document_id, document.version)
+        >= MAX_ATTEMPTS_PER_DOCUMENT
+    ):
         message = f"exhausted the {MAX_ATTEMPTS_PER_DOCUMENT}-attempt download budget"
         report.failed += 1
         report.errors.append(f"document {document.document_id}: {message}")

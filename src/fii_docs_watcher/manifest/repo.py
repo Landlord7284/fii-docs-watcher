@@ -137,7 +137,14 @@ class ManifestRepo:
         would find these rows every run while nothing ever downloaded them.
         """
         now = timestamp()
-        cursor = self.connection.execute(
+        is_new = (
+            self.connection.execute(
+                "SELECT 1 FROM documents WHERE document_id = ? AND version = ?",
+                (row.document_id, row.version),
+            ).fetchone()
+            is None
+        )
+        self.connection.execute(
             """
             INSERT INTO documents (
                 document_id, version, fundosnet_id, entity_cnpj, fund_description,
@@ -179,8 +186,7 @@ class ManifestRepo:
                 now,
             ),
         )
-        # rowcount is 1 for a fresh insert and 2 for an upsert that updated.
-        return cursor.rowcount == 1
+        return is_new
 
     def correlatable_in_window(self, first: date, last: date) -> list[ManifestDocument]:
         """Rows a re-filing may replace, or be, inside the retention window.
@@ -587,6 +593,25 @@ class ManifestRepo:
         row = self.connection.execute(
             "SELECT COUNT(*) AS n FROM download_attempts WHERE document_id = ? AND version = ?",
             (document_id, version),
+        ).fetchone()
+        return int(row["n"])
+
+    def failure_attempt_count(self, document_id: int, version: int) -> int:
+        """Attempts that consume the retry budget for a publication."""
+        row = self.connection.execute(
+            """
+            SELECT COUNT(*) AS n
+              FROM download_attempts
+             WHERE document_id = ? AND version = ?
+               AND outcome IN (?, ?, ?)
+            """,
+            (
+                document_id,
+                version,
+                AttemptOutcome.TRANSIENT.value,
+                AttemptOutcome.INVALID_CONTENT.value,
+                AttemptOutcome.ERROR.value,
+            ),
         ).fetchone()
         return int(row["n"])
 

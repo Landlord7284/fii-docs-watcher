@@ -74,6 +74,9 @@ registry_url = "https://dados.cvm.gov.br/dados/FI/CAD/DADOS/registro_fundo_class
 refresh_interval_hours = 24
 read_timeout_seconds = 180.0
 
+# Refuse to buffer a registry response larger than this (bytes).
+max_response_bytes = 104857600
+
 [audit]
 # The global-listing cross-check (detective only, never a discovery path).
 # "daily", "weekly" or "never".

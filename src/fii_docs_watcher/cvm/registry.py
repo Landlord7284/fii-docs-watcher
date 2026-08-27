@@ -24,9 +24,12 @@ snapshot -- it is discarded and the previous one stays in place.
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 import logging
+import os
+import tempfile
 import zipfile
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -37,7 +40,7 @@ import httpx
 
 from ..clock import source_tz, timestamp
 from ..config import CvmConfig
-from ..errors import TransientSourceError
+from ..errors import SourceContractError, TransientSourceError
 from ..scope.cnpj import normalize
 from ..text import fold_name
 
@@ -71,6 +74,21 @@ _CLASS_PREFIX = "classes de cotas de fundos "
 DEAD_SITUATIONS = frozenset({"cancelado", "liquidado"})
 
 _STATE_FILE = "snapshot.json"
+_MAX_UNCOMPRESSED_REGISTRY_BYTES = 256 * 1024 * 1024
+
+_FUND_REQUIRED_FIELDS = frozenset(
+    {"ID_Registro_Fundo", "CNPJ_Fundo", "Tipo_Fundo", "Denominacao_Social", "Situacao"}
+)
+_CLASS_REQUIRED_FIELDS = frozenset(
+    {
+        "ID_Registro_Classe",
+        "ID_Registro_Fundo",
+        "CNPJ_Classe",
+        "Tipo_Classe",
+        "Denominacao_Social",
+        "Situacao",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -213,15 +231,17 @@ class RegistrySnapshot:
             # one fund whose classes are registered twice under the same CNPJ and
             # the same name. Left in, the duplicate would make the robot query
             # and archive the same entity twice.
-            entities: list[RegistryEntity] = []
-            seen: set[tuple[str, str]] = set()
+            grouped_classes: dict[tuple[str, str], list[RegisteredClass]] = {}
             for fund in funds:
                 for sibling in self._classes_by_fund.get(fund.registry_id, []):
-                    entity = _class_entity([sibling])
-                    key_pair = (entity.cnpj, entity.legal_name)
-                    if entity.active and key_pair not in seen:
-                        seen.add(key_pair)
-                        entities.append(entity)
+                    key_pair = (sibling.cnpj, sibling.legal_name)
+                    grouped_classes.setdefault(key_pair, []).append(sibling)
+
+            entities = [
+                entity
+                for siblings in grouped_classes.values()
+                if (entity := _class_entity(siblings)).active
+            ]
 
             anchor = _fund_entity(funds)
             # Monoclass: the fund and its only class share the CNPJ, so listing
@@ -312,10 +332,72 @@ def _class_entity(classes: list[RegisteredClass]) -> RegistryEntity:
     )
 
 
-def _read_csv(archive: zipfile.ZipFile, name: str) -> list[dict[str, str]]:
+def _read_csv(
+    archive: zipfile.ZipFile, name: str, required_fields: frozenset[str]
+) -> list[dict[str, str]]:
     with archive.open(name) as raw:
         text = io.TextIOWrapper(raw, encoding=ENCODING, newline="")
-        return list(csv.DictReader(text, delimiter=DELIMITER))
+        reader = csv.DictReader(text, delimiter=DELIMITER)
+        missing = required_fields - set(reader.fieldnames or ())
+        if missing:
+            raise ValueError(f"{name} is missing column(s): {', '.join(sorted(missing))}")
+        return list(reader)
+
+
+def _parse_funds(archive: zipfile.ZipFile) -> list[RegisteredFund]:
+    funds: list[RegisteredFund] = []
+    for row in _read_csv(archive, FUND_FILE, _FUND_REQUIRED_FIELDS):
+        family = (row.get("Tipo_Fundo") or "").strip().upper()
+        if family not in SERVABLE_FAMILIES:
+            continue
+        cnpj = normalize(row.get("CNPJ_Fundo"))
+        if cnpj is None:
+            continue
+        registry_id = (row.get("ID_Registro_Fundo") or "").strip()
+        legal_name = (row.get("Denominacao_Social") or "").strip()
+        if not registry_id or not legal_name:
+            raise ValueError("monitorable fund row has an empty registry id or legal name")
+        funds.append(
+            RegisteredFund(
+                registry_id=registry_id,
+                cnpj=cnpj,
+                cvm_code=(row.get("Codigo_CVM") or "").strip(),
+                legal_name=legal_name,
+                situation=(row.get("Situacao") or "").strip(),
+                family=family,
+            )
+        )
+    return funds
+
+
+def _parse_classes(archive: zipfile.ZipFile) -> list[RegisteredClass]:
+    classes: list[RegisteredClass] = []
+    for row in _read_csv(archive, CLASS_FILE, _CLASS_REQUIRED_FIELDS):
+        family = class_family(row.get("Tipo_Classe") or "")
+        if family not in SERVABLE_FAMILIES:
+            continue
+        cnpj = normalize(row.get("CNPJ_Classe"))
+        if cnpj is None:
+            continue
+        registry_id = (row.get("ID_Registro_Classe") or "").strip()
+        fund_registry_id = (row.get("ID_Registro_Fundo") or "").strip()
+        legal_name = (row.get("Denominacao_Social") or "").strip()
+        if not registry_id or not fund_registry_id or not legal_name:
+            raise ValueError(
+                "monitorable class row has an empty registry id, fund id or legal name"
+            )
+        classes.append(
+            RegisteredClass(
+                registry_id=registry_id,
+                fund_registry_id=fund_registry_id,
+                cnpj=cnpj,
+                cvm_code=(row.get("Codigo_CVM") or "").strip(),
+                legal_name=legal_name,
+                situation=(row.get("Situacao") or "").strip(),
+                family=family,
+            )
+        )
+    return classes
 
 
 def parse_archive(data: bytes) -> RegistrySnapshot:
@@ -330,44 +412,15 @@ def parse_archive(data: bytes) -> RegistrySnapshot:
         if missing:
             raise ValueError(f"registry archive is missing {', '.join(sorted(missing))}")
 
-        funds: list[RegisteredFund] = []
-        for row in _read_csv(archive, FUND_FILE):
-            family = (row.get("Tipo_Fundo") or "").strip().upper()
-            if family not in SERVABLE_FAMILIES:
-                continue
-            cnpj = normalize(row.get("CNPJ_Fundo"))
-            if cnpj is None:
-                continue
-            funds.append(
-                RegisteredFund(
-                    registry_id=(row.get("ID_Registro_Fundo") or "").strip(),
-                    cnpj=cnpj,
-                    cvm_code=(row.get("Codigo_CVM") or "").strip(),
-                    legal_name=(row.get("Denominacao_Social") or "").strip(),
-                    situation=(row.get("Situacao") or "").strip(),
-                    family=family,
-                )
+        expanded_bytes = sum(info.file_size for info in archive.infolist())
+        if expanded_bytes > _MAX_UNCOMPRESSED_REGISTRY_BYTES:
+            raise ValueError(
+                "registry archive expands beyond the safety limit "
+                f"({_MAX_UNCOMPRESSED_REGISTRY_BYTES} bytes)"
             )
 
-        classes: list[RegisteredClass] = []
-        for row in _read_csv(archive, CLASS_FILE):
-            family = class_family(row.get("Tipo_Classe") or "")
-            if family not in SERVABLE_FAMILIES:
-                continue
-            cnpj = normalize(row.get("CNPJ_Classe"))
-            if cnpj is None:
-                continue
-            classes.append(
-                RegisteredClass(
-                    registry_id=(row.get("ID_Registro_Classe") or "").strip(),
-                    fund_registry_id=(row.get("ID_Registro_Fundo") or "").strip(),
-                    cnpj=cnpj,
-                    cvm_code=(row.get("Codigo_CVM") or "").strip(),
-                    legal_name=(row.get("Denominacao_Social") or "").strip(),
-                    situation=(row.get("Situacao") or "").strip(),
-                    family=family,
-                )
-            )
+        funds = _parse_funds(archive)
+        classes = _parse_classes(archive)
 
     if not funds and not classes:
         raise ValueError("registry archive contained no monitorable funds or classes")
@@ -384,20 +437,27 @@ class RegistryCache:
         self.archive_path = cache_dir / "registro_fundo_classe.zip"
         self.state_path = cache_dir / _STATE_FILE
 
-    def _state(self) -> dict[str, str]:
+    def _state(self) -> dict[str, object]:
         try:
-            return json.loads(self.state_path.read_text(encoding="utf-8"))
+            state = json.loads(self.state_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return {}
+        return state if isinstance(state, dict) else {}
 
     def _is_fresh(self) -> bool:
         state = self._state()
         stamp = state.get("fetched_at")
-        if not stamp or not self.archive_path.is_file():
+        digest = state.get("sha256")
+        if not isinstance(stamp, str) or not isinstance(digest, str):
+            return False
+        if not self.archive_path.is_file():
             return False
         try:
             fetched = datetime.fromisoformat(stamp)
-        except ValueError:
+            actual_digest = hashlib.sha256(self.archive_path.read_bytes()).hexdigest()
+        except (OSError, ValueError):
+            return False
+        if actual_digest != digest:
             return False
         if fetched.tzinfo is None:
             fetched = fetched.replace(tzinfo=source_tz())
@@ -411,10 +471,23 @@ class RegistryCache:
                 timeout=httpx.Timeout(self.config.read_timeout_seconds, connect=15.0),
                 headers={"User-Agent": user_agent},
                 follow_redirects=True,
-            ) as client:
-                response = client.get(self.config.registry_url)
+            ) as client, client.stream("GET", self.config.registry_url) as response:
                 response.raise_for_status()
-                return response.content
+                chunks: list[bytes] = []
+                total = 0
+                for chunk in response.iter_bytes():
+                    total += len(chunk)
+                    if total > self.config.max_response_bytes:
+                        raise SourceContractError(
+                            "CVM registry response exceeds max_response_bytes "
+                            f"({self.config.max_response_bytes})",
+                            context={
+                                "url": self.config.registry_url,
+                                "limit": self.config.max_response_bytes,
+                            },
+                        )
+                    chunks.append(chunk)
+                return b"".join(chunks)
         except httpx.HTTPError as exc:
             raise TransientSourceError(
                 f"could not download the CVM registry: {exc}",
@@ -442,7 +515,7 @@ class RegistryCache:
         try:
             data = self._download(user_agent)
             snapshot = parse_archive(data)
-        except (TransientSourceError, ValueError, zipfile.BadZipFile) as exc:
+        except (TransientSourceError, SourceContractError, ValueError, zipfile.BadZipFile) as exc:
             log.warning(
                 "CVM registry refresh failed; falling back to the last valid snapshot",
                 extra={"error": str(exc)},
@@ -451,12 +524,14 @@ class RegistryCache:
 
         # Only replace the cached archive once the new one has parsed. An
         # invalid download must never displace a valid snapshot.
-        tmp = self.archive_path.with_suffix(".zip.part")
-        tmp.write_bytes(data)
-        tmp.replace(self.archive_path)
-        self.state_path.write_text(
-            json.dumps({"fetched_at": snapshot.fetched_at, "bytes": len(data)}, ensure_ascii=False),
-            encoding="utf-8",
+        digest = hashlib.sha256(data).hexdigest()
+        _atomic_write(self.archive_path, data)
+        _atomic_write(
+            self.state_path,
+            json.dumps(
+                {"fetched_at": snapshot.fetched_at, "bytes": len(data), "sha256": digest},
+                ensure_ascii=False,
+            ).encode("utf-8"),
         )
         log.info(
             "CVM registry refreshed",
@@ -479,5 +554,24 @@ class RegistryCache:
                 extra={"error": str(exc), "path": str(self.archive_path)},
             )
             return None
-        snapshot.fetched_at = self._state().get("fetched_at", snapshot.fetched_at)
+        fetched_at = self._state().get("fetched_at")
+        if isinstance(fetched_at, str):
+            snapshot.fetched_at = fetched_at
         return snapshot
+
+
+def _atomic_write(path: Path, data: bytes) -> None:
+    """Publish one cache file atomically with a unique same-directory temporary."""
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)

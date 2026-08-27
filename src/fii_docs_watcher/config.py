@@ -133,6 +133,7 @@ class CvmConfig:
     registry_url: str = "https://dados.cvm.gov.br/dados/FI/CAD/DADOS/registro_fundo_classe.zip"
     refresh_interval_hours: int = 24
     read_timeout_seconds: float = 180.0
+    max_response_bytes: int = 100 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -383,6 +384,8 @@ def _validate(config: Config) -> None:
         raise ConfigError(f"[logging].format must be text or json, got {config.logging.format!r}")
     if config.source.max_retries < 0:
         raise ConfigError("[source].max_retries must be >= 0")
+    if config.cvm.max_response_bytes < 1:
+        raise ConfigError("[cvm].max_response_bytes must be >= 1")
 
     data_root = config.paths.data_root.resolve()
     documents_root = config.paths.documents_root.resolve()

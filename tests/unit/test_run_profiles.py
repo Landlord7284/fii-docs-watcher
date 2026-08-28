@@ -193,3 +193,37 @@ class TestTheFlagReachesTheRun:
 
     def test_the_parser_defaults_to_the_sweep(self) -> None:
         assert cli.build_parser().parse_args(["run"]).monitor is False
+
+
+class TestARefreshedSpellingIsPersisted:
+    """A description refresh must reach funds.yaml through the existing save.
+
+    The gate matches against the stored spelling, so a refresh that stayed
+    in memory would be recomputed -- and re-logged -- on every single run.
+    """
+
+    def _saves(self, monkeypatch: pytest.MonkeyPatch) -> list[int]:
+        saves: list[int] = []
+        monkeypatch.setattr(run, "_save", lambda *_a, **_k: saves.append(1))
+        return saves
+
+    def test_a_refresh_triggers_the_save(self, profiled, monkeypatch) -> None:
+        config, _seen = profiled
+        saves = self._saves(monkeypatch)
+        monkeypatch.setattr(
+            run.discover,
+            "run",
+            lambda *_a, **_k: discover.DiscoveryReport(descriptions_refreshed=1),
+        )
+
+        run.execute(config)
+
+        assert saves
+
+    def test_no_refresh_and_no_confirmation_saves_nothing(self, profiled, monkeypatch) -> None:
+        config, _seen = profiled
+        saves = self._saves(monkeypatch)
+
+        run.execute(config)
+
+        assert not saves

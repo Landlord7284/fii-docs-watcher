@@ -327,7 +327,8 @@ def execute(
 
                 # Confirmations earned during fetching belong in the YAML, so a
                 # CNPJ already validated is not revalidated on every future run.
-                if any(e.cnpj_confirmed for s in scopes for e in s.entities):
+                refreshed = bool(report.discovery and report.discovery.descriptions_refreshed)
+                if refreshed or any(e.cnpj_confirmed for s in scopes for e in s.entities):
                     for scope in scopes:
                         funds_file.update_scope(scope)
                     _save(funds_file, config, report)

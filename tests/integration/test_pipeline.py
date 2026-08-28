@@ -646,6 +646,62 @@ class TestUnwatchedEntities:
         assert repo.get(9001, 1).local_state == LocalState.PURGED
 
 
+class TestDescriptionRefresh:
+    """Per-entity discovery keeps the stored Fundos.NET spelling current.
+
+    The monitor's gate matches rows against `fnet_fund_description`, so a
+    rename the sweep observed but never wrote back would silently blind the
+    gate for that fund until a human re-resolved it.
+    """
+
+    def test_a_rename_observed_by_a_sweep_lands_in_the_saved_yaml(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        renamed = "HEDGE BRASIL SHOPPING FDO INV IMOB RENOMEADO"
+        fake.add_documents(FUND_ID, [make_row(9101, fund=renamed)])
+
+        report = discover.run(
+            client, repo, scopes, retention_window(7), page_length=200
+        )
+
+        assert report.descriptions_refreshed == 1
+        assert scopes[0].entities[0].fnet_fund_description == renamed
+
+        # And it survives the round trip a real run performs afterwards.
+        funds_file = FundsFile.load(config.paths.funds_file)
+        funds_file.update_scope(scopes[0])
+        funds_file.save()
+        reloaded = FundsFile.load(config.paths.funds_file).scopes()
+        assert reloaded[0].entities[0].fnet_fund_description == renamed
+
+    def test_the_newest_row_decides_the_spelling(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        fake.add_documents(
+            FUND_ID,
+            [
+                make_row(9102, fund="OLDER SPELLING", delivery_time="09:00"),
+                make_row(9103, fund="NEWER SPELLING", delivery_time="18:00"),
+            ],
+        )
+
+        discover.run(client, repo, scopes, retention_window(7), page_length=200)
+
+        assert scopes[0].entities[0].fnet_fund_description == "NEWER SPELLING"
+
+    def test_an_empty_scan_changes_nothing(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        before = scopes[0].entities[0].fnet_fund_description
+        report = discover.run(client, repo, scopes, retention_window(7), page_length=200)
+
+        assert report.descriptions_refreshed == 0
+        assert scopes[0].entities[0].fnet_fund_description == before
+
+
 class TestTheNarrowSweep:
     """`run --monitor` sweeps fewer dates, and must not claim it swept more.
 

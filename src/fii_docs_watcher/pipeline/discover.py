@@ -56,6 +56,11 @@ class DiscoveryReport:
     documents_new: int = 0
     incomplete_scans: int = 0
     invalid_rows: int = 0
+    # Entities whose stored fnet_fund_description was refreshed from a scanned
+    # row. The caller persists funds.yaml when this is non-zero: the monitor's
+    # gate matches against the stored spelling, so a rename the sweep observed
+    # but never wrote back would blind the gate until someone re-resolved.
+    descriptions_refreshed: int = 0
     # Newest-first reads that failed or broke the descending contract. Only
     # run_monitor produces these; each one already means the sweep is the only
     # thing covering that fund type until a later firing succeeds.
@@ -125,6 +130,28 @@ def discover_entity(
             )
 
     report.documents_new += new_count
+
+    # Refresh the stored source-side spelling from the newest row. The
+    # resolver writes it once, from a probe -- or, for a fund that had filed
+    # nothing, from listarFundos text that may never fold-equal a real listing
+    # row -- and a rename would otherwise stay unobserved forever. The
+    # monitor's gate matches against exactly this field, so keeping it current
+    # is what makes the design note's "the sweep refreshes the spelling" true.
+    if result.rows:
+        observed = max(result.rows, key=lambda row: row.delivery_at).fund_description
+        if observed and observed != entity.fnet_fund_description:
+            log.info(
+                "entity description refreshed from the listing",
+                extra={
+                    "scope": scope.label,
+                    "fundosnet_id": entity.fundosnet_id,
+                    "old": entity.fnet_fund_description[:90],
+                    "new": observed[:90],
+                },
+            )
+            entity.fnet_fund_description = observed
+            report.descriptions_refreshed += 1
+
     log.info(
         "entity scanned",
         extra={

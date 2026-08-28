@@ -12,6 +12,12 @@ collisions between entities, and on classes carrying their own names. Using it
 to file a document would reintroduce that failure through the back door. So this
 raises an alert asking a human to revalidate the scope, and nothing else.
 
+The monitor's discovery gate (`discover.run_monitor`) reads the same listing
+and folds the same names, but for a different verdict: a match there decides
+which per-entity queries the frequent profile spends -- and still never routes
+a document. The audit stays purely detective; the shared indexing lives in
+`pipeline.watchlist` so the two cannot drift apart.
+
 A failure here is not a failure of the job: the archive is already complete
 without it.
 """
@@ -31,6 +37,7 @@ from ..fnet.schema import DocumentRow
 from ..manifest.repo import ManifestRepo
 from ..scope.models import Scope
 from ..scope.resolver import normalize_name
+from . import watchlist
 
 log = logging.getLogger(__name__)
 
@@ -74,29 +81,20 @@ def run(
     day = reference or today()
     report.ran = True
 
-    # Names of every monitored entity, folded for comparison. Both the scope's
-    # registered legal name and the exact description Fundos.NET returns are
-    # included, because the two spellings diverge routinely.
-    monitored: dict[str, Scope] = {}
-    known_ids: set[int] = set()
-    fund_types: dict[int, None] = {}
-    for scope in scopes:
-        for name in (scope.legal_name, *(e.fnet_fund_description for e in scope.entities)):
-            folded = normalize_name(name or "")
-            if folded:
-                monitored.setdefault(folded, scope)
-        known_ids.update(e.fundosnet_id for e in scope.entities)
-        # The global listing is per fund type, so a watch list spanning
-        # categories needs one scan each. Only the types actually monitored are
-        # scanned: an all-FII watch list costs exactly one request-set, as before.
-        for entity in scope.entities:
-            fund_types.setdefault(entity.fnet_fund_type, None)
+    # The shared per-type index: a name only means something within the fund
+    # type its entity answers under. Unresolved scopes have no type, so their
+    # legal names are checked against every scanned type instead -- a match
+    # there means the fund publishes while the robot cannot query it.
+    monitored = watchlist.monitored_names(scopes)
+    orphaned = watchlist.unassigned_names(scopes)
+    known_ids = {entity.fundosnet_id for scope in scopes for entity in scope.entities}
+    types = watchlist.fund_types(scopes)
 
-    if not monitored:
+    if not monitored and not orphaned:
         return report
 
-    rows: list[DocumentRow] = []
-    for fund_type in fund_types or {FUND_TYPE_FII: None}:
+    rows: list[tuple[int, DocumentRow]] = []
+    for fund_type in types or [FUND_TYPE_FII]:
         try:
             # Yesterday and today: a document delivered late in the day can be
             # missed by a run that happened before it landed.
@@ -115,7 +113,7 @@ def run(
                 extra={"error": str(exc), "fund_type": fund_type},
             )
             continue
-        rows.extend(result.rows)
+        rows.extend((fund_type, row) for row in result.rows)
 
     report.documents_examined = len(rows)
     captured = {
@@ -124,25 +122,34 @@ def run(
         for identity in repo.known_identities_for_entity(fundosnet_id)
     }
 
-    for row in rows:
-        scope = monitored.get(normalize_name(row.fund_description))
-        if scope is None or row.identity in captured:
+    for fund_type, row in rows:
+        folded = normalize_name(row.fund_description)
+        # Every matching scope is reported, not the first: two monitored funds
+        # folding to one name are both worth a human's look.
+        hits: dict[str, Scope] = {}
+        for scope, _entity in monitored.get(fund_type, {}).get(folded, []):
+            hits.setdefault(scope.cnpj, scope)
+        for scope in orphaned.get(folded, []):
+            hits.setdefault(scope.cnpj, scope)
+        if not hits or row.identity in captured:
             continue
-        message = (
-            f"document {row.document_id} v{row.version} names {row.fund_description!r}, which "
-            f"matches monitored scope {scope.label}, but no per-entity query captured it. "
-            "Revalidate the scope: a new class may exist, or a stored fundosnet_id may be stale."
-        )
-        report.unmatched.append(message)
-        log.error(
-            "global audit found a document that per-entity discovery did not capture",
-            extra={
-                "document_id": row.document_id,
-                "version": row.version,
-                "scope": scope.label,
-                "fund_description": row.fund_description[:90],
-            },
-        )
+        for scope in hits.values():
+            message = (
+                f"document {row.document_id} v{row.version} names {row.fund_description!r}, "
+                f"which matches monitored scope {scope.label}, but no per-entity query captured "
+                "it. Revalidate the scope: a new class may exist, or a stored fundosnet_id may "
+                "be stale."
+            )
+            report.unmatched.append(message)
+            log.error(
+                "global audit found a document that per-entity discovery did not capture",
+                extra={
+                    "document_id": row.document_id,
+                    "version": row.version,
+                    "scope": scope.label,
+                    "fund_description": row.fund_description[:90],
+                },
+            )
 
     log.info(
         "global audit finished",
@@ -150,7 +157,7 @@ def run(
             "examined": report.documents_examined,
             "unmatched": len(report.unmatched),
             "scopes": len(scopes),
-            "fund_types": list(fund_types),
+            "fund_types": types,
         },
     )
     return report

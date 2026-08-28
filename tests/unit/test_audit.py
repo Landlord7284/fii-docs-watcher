@@ -80,3 +80,86 @@ def test_a_matching_uncaptured_document_is_reported(monkeypatch) -> None:
     assert len(missing.unmatched) == 1
     assert "document 1001 v1" in missing.unmatched[0]
     assert captured.unmatched == []
+
+
+def test_a_folded_name_collision_reports_every_matching_scope(monkeypatch) -> None:
+    # Two monitored funds legitimately folding to one spelling: the old flat
+    # index kept whichever was indexed first and silently dropped the other.
+    row = parse_row(make_row(1002, fund="TEST FUND"))
+    scopes = [
+        Scope(
+            cnpj="08431747000106",
+            legal_name="Test Fund",
+            entities=[Entity(cnpj="08431747000106", fundosnet_id=1)],
+        ),
+        Scope(
+            cnpj="99999999000199",
+            legal_name="TEST-FUND",
+            entities=[Entity(cnpj="99999999000199", fundosnet_id=2)],
+        ),
+    ]
+    monkeypatch.setattr(
+        audit,
+        "scan",
+        lambda _client, **_kwargs: ScanResult(rows=[row], records_filtered=1),
+    )
+
+    report = audit.run(
+        object(),  # type: ignore[arg-type]
+        _Repo(),  # type: ignore[arg-type]
+        scopes,
+        AuditConfig(frequency="daily"),
+        reference=date(2026, 8, 27),
+    )
+
+    assert len(report.unmatched) == 2
+
+
+def test_a_row_never_matches_a_homonymous_entity_of_another_fund_type(monkeypatch) -> None:
+    # The entity answers under tipoFundo=11 only; the same spelling appearing
+    # in the type-1 listing belongs to some other fund and must not alert.
+    row = parse_row(make_row(1003, fund="TEST FUND"))
+    scope = Scope(
+        cnpj="08431747000106",
+        legal_name="Test Fund",
+        entities=[Entity(cnpj="08431747000106", fundosnet_id=2, fnet_fund_type=11)],
+    )
+
+    def scan_by_type(_client, **kwargs):
+        if kwargs["fund_type"] == 1:
+            return ScanResult(rows=[row], records_filtered=1)
+        return ScanResult(rows=[], records_filtered=0)
+
+    monkeypatch.setattr(audit, "scan", scan_by_type)
+
+    report = audit.run(
+        object(),  # type: ignore[arg-type]
+        _Repo(),  # type: ignore[arg-type]
+        [scope],
+        AuditConfig(frequency="daily"),
+        reference=date(2026, 8, 27),
+    )
+
+    assert report.unmatched == []
+
+
+def test_an_unresolved_scope_still_alerts_on_a_name_match(monkeypatch) -> None:
+    # No entities means no fund type to index under, but a listing row naming
+    # the scope means the fund publishes while the robot cannot query it.
+    row = parse_row(make_row(1004, fund="TEST FUND"))
+    scope = Scope(cnpj="08431747000106", legal_name="Test Fund")
+    monkeypatch.setattr(
+        audit,
+        "scan",
+        lambda _client, **_kwargs: ScanResult(rows=[row], records_filtered=1),
+    )
+
+    report = audit.run(
+        object(),  # type: ignore[arg-type]
+        _Repo(),  # type: ignore[arg-type]
+        [scope],
+        AuditConfig(frequency="daily"),
+        reference=date(2026, 8, 27),
+    )
+
+    assert len(report.unmatched) == 1

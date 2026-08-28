@@ -24,24 +24,15 @@ days = 7
 # on today, and neither changes what the archive keeps -- purge, the index and
 # the frontier stay on [retention].days whichever profile ran.
 #
-# `days` is what `run` sweeps. Unset it and it follows [retention].days, which
-# is what this robot did before the profiles existed. It may never exceed
-# retention: a sweep wider than the window rediscovers what purge has already
-# deleted, so it is refused rather than trimmed.
+# `days` is what `run` sweeps. Unset it and it follows [retention].days. It may 
+# never exceed retention: a sweep wider than the window rediscovers what 
+# purge has already deleted, so it is refused rather than trimmed.
 days = 7
 
 # `monitor_days` is the window of `run --monitor` -- the frequent profile,
 # which reads the source's listing newest-first, stops at what it has already
 # accounted for, queries per entity only the funds that actually filed, and
-# skips the global audit. Two dates, so a document delivered late yesterday is
-# still caught by a monitor that last fired before it arrived.
-#
-# Narrower than retention is coverage traded for frequency, and it is traded
-# honestly: a monitor never records progress, so the staleness warning keeps
-# firing until a full sweep actually covers those days. Schedule a daily `run`
-# beside the monitor -- it is the backstop for anything the monitor's name
-# matching misses, and a re-filing of an older document keeps its original
-# delivery date at the source, so only a query of that older day finds it.
+# skips the global audit. 
 monitor_days = 2
 
 [source]
@@ -54,13 +45,7 @@ base_url = "https://fnet.bmfbovespa.com.br/fnet/publico"
 # produces byte-identical output to a laptop in Sao Paulo.
 #
 # The default is correct for Fundos.NET and there is no reason to change it in
-# normal use. It is exposed for the two cases where a fixed constant would be an
-# obstacle: reproducing a run against a different source, and testing. Note that
-# changing it on an existing archive re-dates everything downloaded afterwards
-# while leaving what is already on disk under the old dates, so treat it as a
-# deployment-wide constant, not a knob. Any IANA name available on the host is
-# accepted; an unrecognised one refuses to start rather than falling back.
-#
+# normal use.
 # This is the one key with no environment override: it is the project's single
 # declaration of a zone, and setting FII_WATCHER_SOURCE_TIMEZONE is an error
 # rather than a second place to name it.
@@ -109,16 +94,7 @@ frequency = "daily"
 
 [download]
 # Which content formats to keep. `downloadDocumento` serves PDF and XML from the
-# same endpoint; only the PDF is kept by default, because this is a reading
-# queue for people and the XML is the same filing in a machine-readable shape.
-# Pipeline B downloads its own, so keeping it here buys nothing unless you want
-# it yourself. To keep both:  formats = ["pdf", "xml"]
-#
-# Where the listing lets the format be predicted (documents whose category or
-# type says "Estruturado" come back as XML) the decision is made *before* the
-# request, so a declined format costs no bandwidth at all. If the prediction
-# turns out wrong, the downloaded file is still declined and a warning is
-# logged.
+# same endpoint; only the PDF is kept by default. both:  formats = ["pdf", "xml"]
 #
 # Documents declined this way are recorded in the manifest as `skipped`, not
 # lost: widening this list later picks them up on the next run, without needing
@@ -129,8 +105,7 @@ formats = ["pdf"]
 stale_part_hours = 6
 
 [files]
-# Creation modes for the shared archive. Never inherit the host default: the
-# files have to be readable by whoever mounts the share.
+# Creation modes for the shared archive.
 directory_mode = 0o755
 file_mode = 0o644
 

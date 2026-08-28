@@ -233,6 +233,36 @@ class TestCursor:
         assert retried.entities_scanned == 1
         assert repo.listing_cursor(1) == self._instant("10:15")
 
+    def test_an_incomplete_gated_scan_freezes_the_cursor_and_the_next_firing_retries(
+        self, repo
+    ) -> None:
+        fake = FakeFnet()
+        fake.add_documents(77, [make_row(2008, fund=FUND_NAME, delivery_time="10:15")])
+        # The source claims more records than pagination ever hands over: the
+        # per-entity scan comes back short without raising. Nothing about the
+        # newest-first read is affected -- it ends normally on a short page.
+        fake.records_filtered_override = 99
+
+        with _client(fake) as client:
+            report = _run(client, repo, [_scope()])
+
+        assert report.entities_scanned == 1
+        assert report.incomplete_scans == 1
+        # An advance here would put the gating row below the frontier, so the
+        # rows pagination omitted would never be gated again and only the
+        # sweep would ever reach them.
+        assert repo.listing_cursor(1) is None
+
+        fake.records_filtered_override = None
+        fake.request_log.clear()
+        with _client(fake) as client:
+            retried = _run(client, repo, [_scope()])
+
+        assert retried.entities_scanned == 1
+        assert retried.incomplete_scans == 0
+        assert any("idFundo=77" in entry for entry in _entity_searches(fake))
+        assert repo.listing_cursor(1) == self._instant("10:15")
+
     def test_an_aborted_read_gates_nothing_and_freezes_the_cursor(self, repo, monkeypatch) -> None:
         fake = FakeFnet()
         fake.add_documents(77, [make_row(2006, fund=FUND_NAME)])

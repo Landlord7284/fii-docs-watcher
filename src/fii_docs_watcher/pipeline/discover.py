@@ -78,8 +78,16 @@ def discover_entity(
     page_length: int,
     report: DiscoveryReport,
     covers_retention: bool = True,
-) -> None:
+) -> bool:
     """Scan one entity's window and persist what it found.
+
+    Returns whether the scan accounted for every row the source claimed. A
+    short scan is not an exception -- the rows it did fetch are real and are
+    kept -- but it is not a completed query either, and a caller that gates on
+    it has to be able to tell the difference. `run` ignores the answer, because
+    the next sweep queries every entity unconditionally regardless;
+    `run_monitor` does not, because its cursor is a promise that everything
+    above it was dealt with.
 
     HTTP happens first and entirely; only then does a single transaction record
     the documents and, if the scan proved complete, advance the watermark. That
@@ -165,6 +173,8 @@ def discover_entity(
             "watermark_advanced": result.complete and covers_retention,
         },
     )
+
+    return result.complete
 
 
 def run(
@@ -256,14 +266,15 @@ def run_monitor(
 
     The cursor advances only when both held: the read came back `complete`
     (frontier crossed under validated descending order, or the listing ended
-    normally) *and* every per-entity discovery it gated concluded without
-    raising. Not advancing self-heals -- the next firing re-reads the same rows
-    and retries -- while advancing past a failed gated discovery would silently
-    hand the document to the sweep alone, forfeiting exactly the latency the
-    monitor exists to buy. Individual malformed rows do not hold the cursor
-    back: they are counted as accounted for, the same arithmetic as the
-    ascending scan's coverage, because one defective row must not poison the
-    cursor forever and the sweep absorbs whatever it named.
+    normally) *and* every per-entity discovery it gated came back complete --
+    neither raising nor returning a short scan. Not advancing self-heals --
+    the next firing re-reads the same rows and retries -- while advancing past
+    a failed or short gated discovery would silently hand the document to the
+    sweep alone, forfeiting exactly the latency the monitor exists to buy.
+    Individual malformed rows do not hold the cursor back: they are counted as
+    accounted for, the same arithmetic as the ascending scan's coverage,
+    because one defective row must not poison the cursor forever and the sweep
+    absorbs whatever it named.
 
     A failed read gates nothing and never falls back to per-entity discovery:
     that would cost one request per entity at the exact moment the source is
@@ -361,7 +372,7 @@ def run_monitor(
                 log.warning("stopping discovery early on request")
                 return report
             try:
-                discover_entity(
+                complete = discover_entity(
                     client,
                     repo,
                     scope=scope,
@@ -372,6 +383,20 @@ def run_monitor(
                     covers_retention=covers_retention,
                 )
                 report.entities_scanned += 1
+                if not complete:
+                    # Pagination handed over fewer rows than the source claimed
+                    # existed. That raises nothing -- what came back was kept --
+                    # but the entity's window was not covered, and advancing the
+                    # cursor past the row that gated it would drop the omitted
+                    # documents below the frontier, leaving the sweep as their
+                    # only path. Freezing costs one re-read of rows the manifest
+                    # already knows.
+                    all_gated_succeeded = False
+                    log.warning(
+                        "gated entity scan was incomplete; "
+                        "the cursor stays put so the next firing retries",
+                        extra={"scope": scope.label, "fundosnet_id": entity.fundosnet_id},
+                    )
             except (TransientSourceError, WatcherError) as exc:
                 all_gated_succeeded = False
                 report.entities_failed += 1

@@ -22,7 +22,8 @@ from fii_docs_watcher.cvm.registry import servable_fund_types
 from fii_docs_watcher.errors import SourceContractError, TransientSourceError
 from fii_docs_watcher.fnet import funds as fnet_funds
 from fii_docs_watcher.fnet.client import FnetClient
-from fii_docs_watcher.fnet.listing import NEWEST_FIRST_SORT, STABLE_SORT, scan
+from fii_docs_watcher.fnet.listing import NEWEST_FIRST_SORT, STABLE_SORT, scan, scan_newest
+from fii_docs_watcher.text import fold_name
 
 LIVE_CONFIG = SourceConfig(min_request_interval_seconds=2.0, max_retries=3)
 
@@ -311,3 +312,112 @@ class TestLiveSource:
             real_estate = fnet_funds.search(client, "POLLI FIAGRO", fund_type=1)
         assert agro, "the agro catalogue no longer lists a known FIAGRO"
         assert not real_estate
+
+    # -- The monitor's newest-first read. Measured 2026-08-27; §7 of
+    # monitor-discovery-analysis.md lists the open questions these answer.
+    # (Whether recordsFiltered decreases across a day is deliberately not
+    # tested: it is unobservable in one run, and the read aborts safely on a
+    # drift anyway.)
+
+    def _global_total(self, client: FnetClient, first: date, last: date) -> int:
+        payload = client.get(
+            "pesquisarGerenciadorDocumentosDados",
+            {
+                "d": 1, "s": 0, "l": 1, "tipoFundo": 1,
+                "dataInicial": first.strftime("%d/%m/%Y"),
+                "dataFinal": last.strftime("%d/%m/%Y"),
+                "idCategoriaDocumento": 0, "idTipoDocumento": 0, "idEspecieDocumento": 0,
+                "isSession": "false", **STABLE_SORT,
+            },
+        ).json()
+        return int(payload["recordsFiltered"])
+
+    def test_the_descending_read_paginates_cleanly_past_200_rows(self) -> None:
+        # §9.5's lesson, applied to the descending sort at l=200: coverage is
+        # asserted on distinct identities against recordsFiltered, never on
+        # the row count, because the count matched perfectly while a fifth of
+        # a day went missing. Descending had only been measured at l=50.
+        window_end = date.today()
+        window_start = window_end
+        with FnetClient(LIVE_CONFIG) as client:
+            for _ in range(14):
+                if self._global_total(client, window_start, window_end) > 200:
+                    break
+                window_start -= timedelta(days=1)
+            else:
+                pytest.skip("no 200-row window found in a fortnight")
+
+            result = scan_newest(
+                client,
+                first=window_start,
+                last=window_end,
+                fund_type=1,
+                cursor=None,
+                page_length=MAX_PAGE_LENGTH,
+            )
+        assert result.complete, f"newest-first read aborted: {result.failure}"
+        assert result.pages >= 2
+        identities = {row.identity for row in result.rows}
+        assert len(identities) + len(result.row_errors) >= result.records_filtered, (
+            f"descending pagination covered {len(identities)} of "
+            f"{result.records_filtered} identities; the ordering guarantee has changed"
+        )
+        assert all(
+            earlier.delivery_at >= later.delivery_at
+            for earlier, later in zip(result.rows, result.rows[1:], strict=False)
+        )
+
+    def test_the_descending_read_holds_for_the_agro_type_too(self) -> None:
+        # The watch list can span fund types and the monitor reads one listing
+        # per type, so the ordering has to hold under tipoFundo=11 as well.
+        window_end = date.today()
+        with FnetClient(LIVE_CONFIG) as client:
+            result = scan_newest(
+                client,
+                first=window_end - timedelta(days=7),
+                last=window_end,
+                fund_type=11,
+                cursor=None,
+                page_length=MAX_PAGE_LENGTH,
+            )
+        if not result.rows:
+            pytest.skip("no FIAGRO filings this week")
+        assert result.complete, f"newest-first read aborted: {result.failure}"
+        assert all(
+            earlier.delivery_at >= later.delivery_at
+            for earlier, later in zip(result.rows, result.rows[1:], strict=False)
+        )
+
+    def test_descricao_fundo_still_carries_the_gate(self) -> None:
+        # The gate folds the global row's descricaoFundo and compares it with
+        # the spelling a per-entity query stores. Deterministic on purpose: a
+        # pinned well-known fund, its per-entity newest row, and the global
+        # row with the same (id, versao) -- no name resolution in the loop.
+        fund_id = 21348  # HEDGE BRASIL SHOPPING FII, the project's usual probe.
+        window_end = date.today()
+        with FnetClient(LIVE_CONFIG) as client:
+            own = scan(
+                client,
+                first=window_end - timedelta(days=30),
+                last=window_end,
+                fundosnet_id=fund_id,
+                page_length=MAX_PAGE_LENGTH,
+            )
+            if not own.rows:
+                pytest.skip("the pinned fund filed nothing in a month")
+            newest = max(own.rows, key=lambda row: row.delivery_at)
+
+            day = newest.delivery_date
+            global_read = scan_newest(
+                client,
+                first=day,
+                last=day,
+                fund_type=1,
+                cursor=None,
+                page_length=MAX_PAGE_LENGTH,
+            )
+        assert global_read.complete, f"newest-first read aborted: {global_read.failure}"
+        assert all(row.fund_description for row in global_read.rows)
+        matches = [row for row in global_read.rows if row.identity == newest.identity]
+        assert matches, "the per-entity row is missing from the global listing of its own day"
+        assert fold_name(matches[0].fund_description) == fold_name(newest.fund_description)

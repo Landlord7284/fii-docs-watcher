@@ -1,11 +1,12 @@
 -- Manifest schema.
 --
--- Three tables, because three responsibilities are genuinely distinct and
+-- Four tables, because four responsibilities are genuinely distinct and
 -- collapsing them loses information:
 --
 --   documents          logical identity, current state, physical traceability
 --   download_attempts  append-only history of every try, successful or not
 --   sync_state         per-entity watermark and last error
+--   listing_cursor     per-fund-type high-water mark of the monitor's read
 --
 -- Putting the attempt result on the document row would overwrite the previous
 -- attempt each time, and a uniqueness constraint that included the state would
@@ -105,4 +106,18 @@ CREATE TABLE IF NOT EXISTS sync_state (
     last_window_end  TEXT,
     last_error       TEXT,
     last_error_at    TEXT
+);
+
+CREATE TABLE IF NOT EXISTS listing_cursor (
+    -- Keyed per fund type, not per entity: the monitor's newest-first read is
+    -- one global listing per type. A cursor for a type nobody monitors any
+    -- more is inert, so `rm` never needs to clean this table.
+    fund_type        INTEGER PRIMARY KEY,
+    -- The newest dataEntrega instant the monitor has accounted for, stored to
+    -- the minute like documents.delivery_at. Advanced only after a complete
+    -- newest-first read AND the per-entity discoveries it gated all succeeded.
+    -- Losing this table is harmless: the fallback is one full read of the
+    -- monitor window.
+    last_delivery_at TEXT NOT NULL,
+    updated_at       TEXT NOT NULL
 );

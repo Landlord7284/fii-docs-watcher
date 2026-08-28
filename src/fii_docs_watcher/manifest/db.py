@@ -1,12 +1,17 @@
-"""SQLite connection and migrations.
+"""SQLite connection and schema versioning.
 
 The manifest lives in the data root, which the configuration forces onto a
 filesystem local to the process: SQLite's locking and durability over SMB or
 NFS are unreliable, and this database is the only thing standing between a
 crashed run and a corrupted archive.
 
-Migrations are tracked with `PRAGMA user_version`, which needs no bookkeeping
-table and cannot itself get out of step with the schema.
+The schema version is tracked with `PRAGMA user_version`, which needs no
+bookkeeping table and cannot itself get out of step with the schema. There is
+no in-place migration code: an older database is deleted and rebuilt from
+`schema.sql`, because the manifest is sliding-window state the next run
+re-derives from the source -- discovery repopulates the window, downloads are
+idempotent, and the watermarks re-establish on the next sweep. `schema.sql`
+therefore stays the single definition of the schema.
 """
 
 from __future__ import annotations
@@ -19,13 +24,48 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 _SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
 
 def connect(path: Path) -> sqlite3.Connection:
-    """Open the manifest, applying pragmas and migrations."""
+    """Open the manifest, rebuilding it when its schema version is behind."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    connection = _open(path)
+    current = connection.execute("PRAGMA user_version").fetchone()[0]
+
+    if current > SCHEMA_VERSION:
+        connection.close()
+        raise RuntimeError(
+            f"manifest schema version {current} is newer than this build understands "
+            f"({SCHEMA_VERSION}); upgrade fii-docs-watcher rather than downgrading the database"
+        )
+
+    if 0 < current < SCHEMA_VERSION:
+        # Deliberate policy: rebuild, never migrate. What is discarded is the
+        # in-window bookkeeping (rediscovered and re-downloaded idempotently by
+        # the next runs), the watermarks (re-established by the next sweep,
+        # with transient staleness warnings until then) and the supersession
+        # and purge history. The archived files themselves are untouched.
+        log.warning(
+            "manifest schema is behind; deleting and rebuilding the manifest",
+            extra={"from": current, "to": SCHEMA_VERSION, "path": str(path)},
+        )
+        connection.close()
+        for suffix in ("", "-wal", "-shm"):
+            Path(f"{path}{suffix}").unlink(missing_ok=True)
+        connection = _open(path)
+        current = 0
+
+    if current == 0:
+        connection.executescript(_SCHEMA_PATH.read_text(encoding="utf-8"))
+        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        log.info("manifest schema created", extra={"version": SCHEMA_VERSION})
+
+    return connection
+
+
+def _open(path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(path, isolation_level=None, timeout=30.0)
     connection.row_factory = sqlite3.Row
 
@@ -37,37 +77,7 @@ def connect(path: Path) -> sqlite3.Connection:
     connection.execute("PRAGMA synchronous = NORMAL")
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute("PRAGMA busy_timeout = 30000")
-
-    _migrate(connection)
     return connection
-
-
-def _migrate(connection: sqlite3.Connection) -> None:
-    current = connection.execute("PRAGMA user_version").fetchone()[0]
-    if current == SCHEMA_VERSION:
-        return
-    if current > SCHEMA_VERSION:
-        raise RuntimeError(
-            f"manifest schema version {current} is newer than this build understands "
-            f"({SCHEMA_VERSION}); upgrade fii-docs-watcher rather than downgrading the database"
-        )
-
-    if current == 0:
-        connection.executescript(_SCHEMA_PATH.read_text(encoding="utf-8"))
-        log.info("manifest schema created", extra={"version": SCHEMA_VERSION})
-
-    # Future migrations chain from here, each guarded by the version it upgrades
-    # from, so a database can be brought forward across several releases at once.
-
-    if 0 < current < 2:
-        # Version 2 records which publication replaced a superseded one, so the
-        # inbox index can name the replacement without re-deriving the match.
-        # A database created from scratch already has these from schema.sql.
-        connection.execute("ALTER TABLE documents ADD COLUMN superseded_by_id INTEGER")
-        connection.execute("ALTER TABLE documents ADD COLUMN superseded_by_version INTEGER")
-        log.info("manifest schema migrated", extra={"from": current, "to": 2})
-
-    connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
 @contextmanager

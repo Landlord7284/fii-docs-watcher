@@ -18,7 +18,7 @@ import logging
 import sqlite3
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from enum import StrEnum
 
 from ..clock import timestamp, to_dir_name
@@ -557,6 +557,27 @@ class ManifestRepo:
             )
         }
 
+    def known_identities(self, pairs: Collection[tuple[int, int]]) -> set[tuple[int, int]]:
+        """Which of these publications the manifest already knows, in one query.
+
+        Serves the monitor's tie-group dedup: rows at the cursor instant carry
+        `idFundo` as null, so the per-entity lookup cannot answer for them, and
+        one batched query beats one round-trip per row.
+        """
+        pairs = tuple(pairs)
+        if not pairs:
+            return set()
+        placeholders = ",".join("(?,?)" for _ in pairs)
+        flat = [value for pair in pairs for value in pair]
+        return {
+            (row["document_id"], row["version"])
+            for row in self.connection.execute(
+                "SELECT document_id, version FROM documents "
+                f"WHERE (document_id, version) IN (VALUES {placeholders})",
+                flat,
+            )
+        }
+
     # ------------------------------------------------------------------- attempts
 
     def record_attempt(
@@ -692,3 +713,38 @@ class ManifestRepo:
                 "SELECT fundosnet_id, COUNT(*) AS n FROM documents GROUP BY fundosnet_id"
             )
         }
+
+    # ------------------------------------------------------------- listing cursor
+
+    def listing_cursor(self, fund_type: int) -> datetime | None:
+        """The newest delivery instant the monitor's read has accounted for."""
+        row = self.connection.execute(
+            "SELECT last_delivery_at FROM listing_cursor WHERE fund_type = ?",
+            (fund_type,),
+        ).fetchone()
+        return datetime.fromisoformat(row["last_delivery_at"]) if row else None
+
+    def all_listing_cursors(self) -> list[sqlite3.Row]:
+        return list(
+            self.connection.execute("SELECT * FROM listing_cursor ORDER BY fund_type")
+        )
+
+    def advance_listing_cursor(self, fund_type: int, newest: datetime) -> None:
+        """Move a fund type's cursor forward, never back.
+
+        Monotone on purpose: the stored ISO instants share the source zone's
+        offset, so text comparison is chronological, and an older instant --
+        from a stale multi-page read or any clock oddity -- is simply ignored
+        rather than reopening rows already accounted for.
+        """
+        self.connection.execute(
+            """
+            INSERT INTO listing_cursor (fund_type, last_delivery_at, updated_at)
+            VALUES (?,?,?)
+            ON CONFLICT (fund_type) DO UPDATE SET
+                last_delivery_at = excluded.last_delivery_at,
+                updated_at       = excluded.updated_at
+            WHERE excluded.last_delivery_at > listing_cursor.last_delivery_at
+            """,
+            (fund_type, newest.isoformat(timespec="minutes"), timestamp()),
+        )

@@ -923,6 +923,7 @@ def cmd_status(config: Config, _args: argparse.Namespace) -> int:
         # Only funds still on the watch list: a gap for a fund you removed on
         # purpose is not a loss to report.
         stale = repo.stale_watermarks(window.first, monitored_ids)
+        cursors = repo.all_listing_cursors()
     finally:
         connection.close()
 
@@ -936,6 +937,11 @@ def cmd_status(config: Config, _args: argparse.Namespace) -> int:
     if not counts:
         print("  (empty)")
     print(f"\navailable inside the window: {len(available)}")
+
+    if cursors:
+        print("\nmonitor listing cursors:")
+        for row in cursors:
+            print(f"  tipoFundo={row['fund_type']}: through {row['last_delivery_at']}")
 
     if stale:
         print("\nwatermark gaps beyond the retention window:", file=sys.stderr)

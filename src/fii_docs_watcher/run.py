@@ -10,7 +10,7 @@ Order matters:
     reconcile  first, so an interrupted run is healed before anything new starts
     registry   once per run, as a snapshot rather than a per-scope lookup
     resolve    only scopes that need it
-    discover   the whole retention window, per entity
+    discover   the whole discovery window, per entity
     supersede  detect, before fetching: never download what a re-filing replaced
     fetch      whatever is pending, including retries from earlier runs
     supersede  sweep, after fetching: delete a replaced file once its winner landed
@@ -50,9 +50,18 @@ class ExitCode:
 
 @dataclass
 class RunReport:
-    """What one run did. Rendered by the CLI and used to choose the exit code."""
+    """What one run did. Rendered by the CLI and used to choose the exit code.
+
+    Both windows are recorded because the two profiles differ in exactly one of
+    them: `window` is what the archive holds and what purge, the inbox and the
+    watermark check are measured against, and `discovery_window` is what this
+    particular run asked the source about. A run that swept two days must not
+    read like a run that swept seven.
+    """
 
     window: RetentionWindow | None = None
+    discovery_window: RetentionWindow | None = None
+    monitor: bool = False
     reconcile: reconcile.ReconcileReport | None = None
     discovery: discover.DiscoveryReport | None = None
     downloads: fetch.FetchReport | None = None
@@ -189,16 +198,36 @@ def _save(funds_file: FundsFile, config: Config, report: RunReport) -> None:
         )
 
 
-def execute(config: Config, *, skip_audit: bool = False, dry_run: bool = False) -> RunReport:
-    """Run the pipeline once. Assumes logging is already configured."""
-    report = RunReport()
+def execute(
+    config: Config,
+    *,
+    monitor: bool = False,
+    skip_audit: bool = False,
+    dry_run: bool = False,
+) -> RunReport:
+    """Run the pipeline once. Assumes logging is already configured.
+
+    `monitor` selects the frequent profile. It changes which configured integer
+    becomes the discovery window, and -- because the global audit is a scan of
+    the entire day's listing and the most expensive request a run makes -- it
+    declines the audit, which the daily sweep is there to run. Everything else
+    is identical between the profiles: supersede, the inbox, purge and the
+    watermark check stay measured against the retention window, and both
+    windows end on the same `today`, read once.
+    """
+    report = RunReport(monitor=monitor)
     window = retention_window(config.retention.days)
+    discovery_window = retention_window(config.sweep_days(monitor=monitor))
     report.window = window
+    report.discovery_window = discovery_window
     log.info(
         "run starting",
         extra={
+            "profile": "monitor" if monitor else "sweep",
             "window": str(window),
             "retention_days": window.days,
+            "discovery_window": str(discovery_window),
+            "discovery_days": discovery_window.days,
             "dry_run": dry_run,
             "config": str(config.source_path) if config.source_path else "built-in defaults",
             "formats": ",".join(config.download.formats),
@@ -260,9 +289,14 @@ def execute(config: Config, *, skip_audit: bool = False, dry_run: bool = False) 
                     client,
                     repo,
                     scopes,
-                    window,
+                    discovery_window,
                     page_length=config.source.page_length,
                     should_stop=lambda: shutdown.requested,
+                    # Passed so the watermark rule is derived from the two
+                    # windows rather than from the profile: a sweep narrower
+                    # than retention must not claim to have observed the days
+                    # it never asked about.
+                    retention=window,
                 )
                 # Scoped to entities somebody still monitors: a gap only means
                 # documents were lost if anyone was following the fund.
@@ -300,7 +334,12 @@ def execute(config: Config, *, skip_audit: bool = False, dry_run: bool = False) 
                 report.inbox = inbox.run(repo, config, window)
                 report.purge = purge.run(repo, config, window)
 
-                if not skip_audit and not shutdown.requested:
+                # The monitor never audits. The audit is a global-listing scan
+                # of the whole day, per fund type -- the costliest request in a
+                # run, and detective-only. Paying it on every firing of the
+                # frequent profile would spend the request budget on a check
+                # the daily sweep is there to make.
+                if not skip_audit and not monitor and not shutdown.requested:
                     report.audit = audit.run(client, repo, scopes, config.audit)
                     report.warnings.extend((report.audit or audit.AuditReport()).unmatched)
 

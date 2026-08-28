@@ -646,6 +646,111 @@ class TestUnwatchedEntities:
         assert repo.get(9001, 1).local_state == LocalState.PURGED
 
 
+class TestTheNarrowSweep:
+    """`run --monitor` sweeps fewer dates, and must not claim it swept more.
+
+    The rule is derived from the two windows rather than from the profile, so
+    these tests describe windows and never a flag.
+    """
+
+    def test_a_narrow_sweep_records_documents_but_not_the_watermark(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        retention = retention_window(7)
+        monitor = retention_window(2)
+        fake.add_documents(FUND_ID, [make_row(9001)])
+
+        report = discover.run(
+            client, repo, scopes, monitor, page_length=200, retention=retention
+        )
+
+        # The documents it did see are archived exactly as any other run's.
+        assert report.documents_new == 1
+        assert repo.get(9001, 1).local_state == LocalState.DISCOVERED
+        # But the five days it never asked about are not claimed as observed.
+        assert repo.watermark(FUND_ID) is None
+
+    def test_a_sweep_covering_retention_still_advances_it(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        window = retention_window(7)
+        fake.add_documents(FUND_ID, [make_row(9001)])
+
+        discover.run(client, repo, scopes, window, page_length=200, retention=window)
+
+        assert repo.watermark(FUND_ID)["last_window_end"] == to_dir_name(window.last)
+
+    def test_a_wider_sweep_than_retention_also_counts_as_covering(self, env) -> None:
+        # The rule is "did it reach the frontier", not "is it the same window".
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        discover.run(
+            client,
+            repo,
+            scopes,
+            retention_window(9),
+            page_length=200,
+            retention=retention_window(7),
+        )
+
+        assert repo.watermark(FUND_ID) is not None
+
+    def test_omitting_the_retention_window_means_this_is_the_retention_sweep(
+        self, env
+    ) -> None:
+        # Every caller that predates the profiles meant exactly that, so the
+        # default has to keep behaving as it always did.
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        discover.run(client, repo, scopes, retention_window(2), page_length=200)
+
+        assert repo.watermark(FUND_ID) is not None
+
+    def test_a_narrow_sweep_leaves_an_older_watermark_where_it_was(self, env) -> None:
+        """The gap alarm must keep firing while only the monitor is running.
+
+        If a narrow sweep moved the watermark forward, stopping the daily sweep
+        would look like full coverage forever -- which is the one thing the
+        watermark exists to make impossible.
+        """
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        retention = retention_window(7)
+        stale_day = today() - timedelta(days=90)
+        repo.advance_watermark(FUND_ID, stale_day)
+
+        discover.run(
+            client, repo, scopes, retention_window(2), page_length=200, retention=retention
+        )
+
+        assert repo.watermark(FUND_ID)["last_window_end"] == to_dir_name(stale_day)
+        assert len(discover.check_watermarks(repo, retention, {FUND_ID})) == 1
+
+    def test_an_incomplete_narrow_scan_still_records_the_entity_error(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        fake.add_documents(FUND_ID, [make_row(9001), make_row(9002)])
+        fake.records_filtered_override = 99
+
+        report = discover.run(
+            client,
+            repo,
+            scopes,
+            retention_window(2),
+            page_length=200,
+            retention=retention_window(7),
+        )
+
+        assert report.incomplete_scans == 1
+        assert repo.watermark(FUND_ID)["last_error"]
+
+
 class TestWatermarkWarnings:
     def _stale(self, repo, fundosnet_id: int) -> None:
         from fii_docs_watcher.clock import to_dir_name, today

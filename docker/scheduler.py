@@ -16,6 +16,19 @@ should: `[source].timezone` is the only place the project declares a zone.
 twelve hours away, so reintroducing the coupling fails a test rather than
 quietly shifting when every run fires.
 
+There are two profiles, each with a schedule of its own: the daily `sweep`,
+which covers `[discovery].days` and runs the global audit, and the frequent
+`monitor`, which covers the narrower `[discovery].monitor_days` and does not.
+A schedule says how often to look and a window says how far back, which are
+different questions -- so schedules live here, in the environment, and windows
+live in `config.toml`. A crontab entry names a profile and never a number, and
+retuning coverage stays a configuration edit.
+
+The loop is serial: it spawns one run and waits for it. A firing that lands
+while a run is still going is skipped rather than queued, so the two profiles
+never contend for the lock, and a monitor missed under a long sweep costs
+nothing -- its window overlaps the next firing's.
+
 Matching is done by waking at the top of every minute and asking whether the
 current minute satisfies the expression. That is a great deal simpler than
 computing the next firing instant, and it has no DST edge cases to get wrong:
@@ -40,7 +53,16 @@ from fii_docs_watcher.logging_setup import configure
 
 log = logging.getLogger("fii_docs_watcher.scheduler")
 
-DEFAULT_SCHEDULE = "0 8/6 * * *"
+#: The frequent profile, hourly through the publishing day.
+DEFAULT_MONITOR_SCHEDULE = "0 7-23 * * *"
+
+#: The full sweep, once a day and early, so the audit and the wider window land
+#: before anyone opens the archive.
+DEFAULT_SWEEP_SCHEDULE = "10 5 * * *"
+
+#: Retired in favour of the two above. Still read, because a deployment that
+#: was configured before the profiles existed must not be silently rescheduled.
+LEGACY_SCHEDULE_VAR = "RUN_SCHEDULE"
 
 # minute, hour, day-of-month, month, day-of-week -- the standard five, in the
 # standard order, with the ranges Vixie cron uses.
@@ -164,11 +186,87 @@ class Schedule:
         return day_ok and weekday_ok
 
 
+#: What each profile costs the CLI, and the argument that says so. The monitor
+#: also declines the global audit, but that follows from the profile inside the
+#: pipeline rather than from a second flag here.
+PROFILE_ARGUMENTS = {"sweep": ("run",), "monitor": ("run", "--monitor")}
+
+
 def _env_flag(name: str, default: bool) -> bool:
+    """Read a boolean variable, defaulting only when it is unset or blank."""
     raw = os.environ.get(name)
     if raw is None or not raw.strip():
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _schedule_for(profile: str, expression: str, fallback: str) -> Schedule | None:
+    """The schedule one profile fires on, or None when it is switched off.
+
+    `<PROFILE>_ENABLED=false` drops the profile entirely rather than pushing it
+    somewhere it will never fire, so a disabled profile is visible in the log
+    as absent instead of having to be inferred from an odd expression.
+    """
+    if not _env_flag(f"{profile.upper()}_ENABLED", default=True):
+        return None
+    return Schedule.parse(expression or fallback)
+
+
+def _sweep_schedule() -> Schedule | None:
+    """The sweep's schedule, honouring the variable this predates.
+
+    `RUN_SCHEDULE` was the only schedule before the profiles existed, and what
+    it named -- the whole run, audit included -- is now the sweep. A deployment
+    already carrying it in a `.env` must keep firing when it always has, so it
+    is read rather than ignored, and said out loud rather than read silently.
+    Set alongside a differing `SWEEP_SCHEDULE` it is refused: two answers to
+    one question is how a schedule drifts away from what its operator believes.
+    """
+    legacy = (os.environ.get(LEGACY_SCHEDULE_VAR) or "").strip()
+    declared = (os.environ.get("SWEEP_SCHEDULE") or "").strip()
+    if legacy and declared and legacy != declared:
+        raise ScheduleError(
+            f"{LEGACY_SCHEDULE_VAR}={legacy!r} and SWEEP_SCHEDULE={declared!r} disagree; "
+            f"{LEGACY_SCHEDULE_VAR} is the retired spelling of the same setting, so drop it"
+        )
+    if legacy and not declared:
+        log.warning(
+            "%s is retired; read as SWEEP_SCHEDULE for now, but rename it",
+            LEGACY_SCHEDULE_VAR,
+            extra={"schedule": legacy},
+        )
+        declared = legacy
+    return _schedule_for("sweep", declared, DEFAULT_SWEEP_SCHEDULE)
+
+
+def _run_on_start() -> str:
+    """Which profile a container start runs, if any: `sweep`, `monitor` or `none`.
+
+    The sweep, by default. A start usually follows a restart, an image update
+    or downtime -- the gap case exactly, and the one the monitor's narrow
+    window cannot see.
+
+    `true` and `false` are the spellings this predates and still mean what they
+    meant, mapped to `sweep` and `none`: an operator who wrote `true` asked for
+    a catch-up run, and that run is the sweep.
+    """
+    raw = (os.environ.get("RUN_ON_START") or "").strip().lower()
+    if not raw:
+        return "sweep"
+    legacy = {"1": "sweep", "true": "sweep", "yes": "sweep", "on": "sweep",
+              "0": "none", "false": "none", "no": "none", "off": "none"}
+    if raw in legacy:
+        log.warning(
+            "RUN_ON_START=%s is the retired spelling; read as %r, but write the profile",
+            raw,
+            legacy[raw],
+        )
+        return legacy[raw]
+    if raw not in PROFILE_ARGUMENTS and raw != "none":
+        raise ScheduleError(
+            f"RUN_ON_START must be sweep, monitor or none, not {raw!r}"
+        )
+    return raw
 
 
 class Runner:
@@ -193,10 +291,17 @@ class Runner:
         else:
             log.warning("%s received; stopping", name)
 
-    def run_once(self) -> int:
-        log.info("starting a run")
+    def run_once(self, profile: str = "sweep") -> int:
+        """Spawn one run of one profile and wait for it.
+
+        Waiting is what keeps the two profiles from ever contending for the
+        lock: a firing that lands mid-run is skipped by the loop rather than
+        queued behind this one.
+        """
+        arguments = PROFILE_ARGUMENTS[profile]
+        log.info("starting a run", extra={"profile": profile})
         started = time.monotonic()
-        self._child = subprocess.Popen([sys.executable, "-m", "fii_docs_watcher", "run"])
+        self._child = subprocess.Popen([sys.executable, "-m", "fii_docs_watcher", *arguments])
         try:
             code = self._child.wait()
         finally:
@@ -206,7 +311,11 @@ class Runner:
         # A non-zero exit is reported and then forgotten: isolated failures are
         # normal, and the next tick is the retry.
         level = logging.INFO if code == 0 else logging.WARNING
-        log.log(level, "run finished", extra={"exit_code": code, "seconds": round(elapsed, 1)})
+        log.log(
+            level,
+            "run finished",
+            extra={"profile": profile, "exit_code": code, "seconds": round(elapsed, 1)},
+        )
         return code
 
     def sleep_until_next_minute(self) -> None:
@@ -221,6 +330,21 @@ class Runner:
                 return
 
 
+def due(schedules: dict[str, Schedule | None], moment: datetime) -> str | None:
+    """Which profile this minute calls for, if either.
+
+    When both match the same minute the sweep wins and the monitor is dropped:
+    the sweep covers every date the monitor would have, so running both would
+    be one wasted pass over the same days -- and the loop is serial, so the
+    second would only start after the first finished anyway.
+    """
+    for profile in ("sweep", "monitor"):
+        schedule = schedules.get(profile)
+        if schedule is not None and schedule.matches(moment):
+            return profile
+    return None
+
+
 def main() -> int:
     try:
         loaded = config.load()
@@ -231,9 +355,23 @@ def main() -> int:
     configure(loaded.logging)
 
     try:
-        schedule = Schedule.parse(os.environ.get("RUN_SCHEDULE") or DEFAULT_SCHEDULE)
+        schedules = {
+            "sweep": _sweep_schedule(),
+            "monitor": _schedule_for(
+                "monitor",
+                (os.environ.get("MONITOR_SCHEDULE") or "").strip(),
+                DEFAULT_MONITOR_SCHEDULE,
+            ),
+        }
+        on_start = _run_on_start()
     except ScheduleError as exc:
-        log.error("RUN_SCHEDULE is not usable: %s", exc)
+        log.error("the schedule is not usable: %s", exc)
+        return 2
+
+    if not any(schedules.values()):
+        # Both profiles off is a container that would run nothing while looking
+        # like it works, which is worse than refusing to start.
+        log.error("both profiles are disabled; this scheduler would never run anything")
         return 2
 
     runner = Runner()
@@ -241,14 +379,16 @@ def main() -> int:
     log.info(
         "scheduler started",
         extra={
-            "schedule": schedule.text,
+            "sweep": schedules["sweep"].text if schedules["sweep"] else "disabled",
+            "monitor": schedules["monitor"].text if schedules["monitor"] else "disabled",
+            "run_on_start": on_start,
             "timezone": str(clock.source_tz()),
             "config": config.describe_source(loaded),
         },
     )
 
-    if _env_flag("RUN_ON_START", default=True):
-        runner.run_once()
+    if on_start != "none":
+        runner.run_once(on_start)
 
     last_fired: str | None = None
     while not runner.stopping:
@@ -260,11 +400,14 @@ def main() -> int:
         stamp = now.strftime("%Y-%m-%dT%H:%M")
         # A run can outlast its own slot; without this the minute it finishes
         # in could fire it a second time.
-        if stamp == last_fired or not schedule.matches(now):
+        if stamp == last_fired:
+            continue
+        profile = due(schedules, now)
+        if profile is None:
             continue
         last_fired = stamp
         try:
-            runner.run_once()
+            runner.run_once(profile)
         except WatcherError:
             # run_once only spawns a process, but a loop that dies on an
             # unexpected error would stop the archive silently.

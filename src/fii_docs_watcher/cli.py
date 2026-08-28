@@ -127,10 +127,14 @@ def build_parser() -> argparse.ArgumentParser:
             "Run the whole pipeline once and exit. This is the only command a scheduler\n"
             "needs; everything else is for setting up and inspecting.\n\n"
             "In order: reconcile anything a previous run left half-done, refresh the CVM\n"
-            "registry snapshot, resolve any scope that needs it, query the whole retention\n"
+            "registry snapshot, resolve any scope that needs it, query the discovery\n"
             "window per entity, download what is new, delete any version a re-filing has\n"
             "replaced, write the inbox index, purge past the frontier, then run the global\n"
             "audit.\n\n"
+            "There are two profiles. Plain `run` sweeps [discovery].days, which follows\n"
+            "[retention].days unless the config says otherwise. `run --monitor` sweeps the\n"
+            "narrower [discovery].monitor_days and skips the global audit, so it is cheap\n"
+            "enough to schedule often. Everything else is the same in both.\n\n"
             "Safe to run as often as you like: rediscovering a document updates its status\n"
             "and never downloads it again."
         ),
@@ -138,6 +142,13 @@ def build_parser() -> argparse.ArgumentParser:
             "Note: this source answers in either ~0.3s or ~60s, so a run with several\n"
             "entities taking minutes is normal, not stuck. Progress is logged per step."
         ),
+    )
+    # A profile, never a number: a cron line says which profile sweeps, so
+    # retuning how many days it covers stays an edit to the config file.
+    run_cmd.add_argument(
+        "--monitor",
+        action="store_true",
+        help="the frequent profile: sweep [discovery].monitor_days and skip the audit",
     )
     run_cmd.add_argument(
         "--dry-run", action="store_true", help="resolve scopes and stop before discovery"
@@ -341,7 +352,9 @@ def _with_debug(config: Config) -> Config:
 
 
 def cmd_run(config: Config, args: argparse.Namespace) -> int:
-    report = execute(config, skip_audit=args.skip_audit, dry_run=args.dry_run)
+    report = execute(
+        config, monitor=args.monitor, skip_audit=args.skip_audit, dry_run=args.dry_run
+    )
     _print_summary(report)
     return report.exit_code
 
@@ -914,6 +927,8 @@ def cmd_status(config: Config, _args: argparse.Namespace) -> int:
         connection.close()
 
     print(f"retention window: {window}  ({window.days} dates, including today)")
+    for line in _window_lines(config):
+        print(f"                  {line}")
     print(f"manifest:         {config.paths.manifest_file}")
     print("\ndocuments by state:")
     for state, count in sorted(counts.items()):
@@ -948,6 +963,8 @@ def cmd_doctor(config: Config, _args: argparse.Namespace) -> int:
     print(f"data root:       {config.paths.data_root}")
     print(f"documents root:  {config.paths.documents_root}")
     print(f"retention:       {config.retention.days} dates")
+    for line in _window_lines(config):
+        print(f"                 {line}")
     formats = ", ".join(config.download.formats)
     suffix = "" if config.download.all_formats else "  (other formats are not downloaded)"
     print(f"formats:         {formats}{suffix}")
@@ -1008,9 +1025,28 @@ def cmd_doctor(config: Config, _args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------- output
 
 
+def _window_lines(config: Config) -> list[str]:
+    """Both discovery windows resolved against today, each named after its profile.
+
+    Printed by `doctor` and `status` so that which dates each profile asks
+    about is verifiable without spending a sweep to find out.
+    """
+    lines = []
+    for command, monitor in (("run", False), ("run --monitor", True)):
+        window = retention_window(config.sweep_days(monitor=monitor))
+        lines.append(f"{window} ({window.days} dates), swept by `{command}`")
+    return lines
+
+
 def _print_summary(report: RunReport) -> None:
     print()
+    print(f"profile           {'monitor' if report.monitor else 'sweep'}")
     print(f"window            {report.window}")
+    # Only when it differs: a run that asked about two days must not read like
+    # one that asked about seven, and repeating an identical window would just
+    # be noise on the profile that has only ever had the one.
+    if report.discovery_window is not None and report.discovery_window != report.window:
+        print(f"discovery window  {report.discovery_window}")
     if report.reconcile:
         print(
             f"reconciled        promoted={report.reconcile.promoted} "

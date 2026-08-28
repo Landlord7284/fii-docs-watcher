@@ -21,22 +21,23 @@ Running it, once a `config.toml` exists (copy `config.example.toml`):
 ```bash
 python -m fii_docs_watcher doctor    # check config, roots, timezone, both sources
 python -m fii_docs_watcher add --cnpj 08.431.747/0001-06 --ticker HGBS11
-python -m fii_docs_watcher run       # the canonical one-shot mode
+python -m fii_docs_watcher run       # the canonical one-shot mode: the daily sweep
+python -m fii_docs_watcher run --monitor   # the frequent profile: narrower window, no audit
 ```
 
 **`USAGE.md` at the repo root is the user-facing command reference** — keep it in step with the CLI.
 
-Other subcommands: `list [QUERY]`, `rm QUERY`, `ticker QUERY`, `resolve`, `reconcile`, `purge`, `audit`, `status`. Exit codes: `0` clean, `1` ran with isolated failures, `2` bad configuration, `3` another instance holds the lock.
+Other subcommands: `list [QUERY]`, `rm QUERY`, `ticker QUERY`, `resolve`, `reconcile`, `purge`, `audit`, `status`. `run` takes `--monitor` for the frequent profile; `doctor` and `status` print both discovery windows and which profile sweeps each. Exit codes: `0` clean, `1` ran with isolated failures, `2` bad configuration, `3` another instance holds the lock.
 
 ## Container packaging
 
 `Dockerfile`, `compose.yaml`, `.env.example` and `docker/` package the robot as an image published to GHCR by `.github/workflows/docker-publish.yml`. Nothing in the package knows about any of it — §7's portability rule holds, and the image is one way to run the same one-shot CLI.
 
-**`config.toml` is the application's configuration in both modes**, mounted at `/config/config.toml` in the container and native on a host. `.env` carries only what has no TOML counterpart: `IMAGE_TAG`, `DOCUMENTS_PATH`, `PUID`/`PGID`, `RUN_SCHEDULE`, `RUN_ON_START`. Do not grow `.env.example` into a second copy of the settings — a config file plus targeted `FII_WATCHER_*` overrides is the arrangement; two parallel documented surfaces is not, and one of them would inevitably drift.
+**`config.toml` is the application's configuration in both modes**, mounted at `/config/config.toml` in the container and native on a host. `.env` carries only what has no TOML counterpart: `IMAGE_TAG`, `DOCUMENTS_PATH`, `PUID`/`PGID`, the two schedules and their enable flags, and `RUN_ON_START`. Do not grow `.env.example` into a second copy of the settings — a config file plus targeted `FII_WATCHER_*` overrides is the arrangement; two parallel documented surfaces is not, and one of them would inevitably drift.
 
 The image pins `FII_WATCHER_PATHS_DATA_ROOT=/data` and `FII_WATCHER_PATHS_DOCUMENTS_ROOT=/documents`, so those two keys in a mounted config are inert. That is deliberate: the container paths follow from the volume layout, and a user who copied the example without repointing `./var/…` would otherwise write the archive into the container's ephemeral layer and lose it on the next recreate.
 
-`docker/scheduler.py` is the periodic driver and lives **outside** the package, because §7 requires a daemon mode to be built on top of one-shot rather than the other way round. It spawns `python -m fii_docs_watcher run` as a child process — so a crash inside a run cannot kill the loop — and matches its 5-field cron expression by waking each minute and testing the current time in `clock.source_tz()`. Schedules therefore mean the same thing as directory names. It is tested by `tests/unit/test_scheduler.py`, which loads it by path.
+`docker/scheduler.py` is the periodic driver and lives **outside** the package, because §7 requires a daemon mode to be built on top of one-shot rather than the other way round. It spawns `python -m fii_docs_watcher run [--monitor]` as a child process — so a crash inside a run cannot kill the loop — and matches its 5-field cron expression by waking each minute and testing the current time in `clock.source_tz()`. Schedules therefore mean the same thing as directory names. It is tested by `tests/unit/test_scheduler.py`, which loads it by path.
 
 **A fund can leave the watch list two ways, and both must stop its backlog.** `discover` stops querying a fund once it leaves `funds.yaml`, but `fetch` builds its queue from the manifest, not from the scope list. Three mechanisms keep that honest:
 
@@ -66,6 +67,21 @@ Consequences worth knowing:
 - The global audit runs one scan per distinct type in the watch list, so it costs nothing extra until a second category is actually registered.
 - A CNPJ is indexed to **every** registry row that carries it, not the first: rows are merged so class expansion and candidate types come from all of its registrations.
 - Downgrading is not safe. An older build ignores `fnet_fund_type`, falls back to 1, and silently finds nothing for a FIAGRO entity.
+
+## Two run profiles over one archive
+
+`run` is the daily sweep; `run --monitor` is the frequent profile. The flag carries a **profile, never a number** — a cron line says which profile sweeps, so retuning a window stays a configuration edit. Two things differ between them and nothing else:
+
+- the discovery window, `[discovery].days` against `[discovery].monitor_days`, chosen once by `config.sweep_days(monitor=)` so that no `if monitor:` exists below `run.execute`;
+- the global audit, which the monitor declines. It is a scan of the whole day's listing per fund type — the costliest request a run makes, and detective-only — and `audit.should_run` is calendar-driven, so `frequency = "daily"` would otherwise fire it on every firing of a frequent profile.
+
+`1 <= monitor_days <= days <= retention.days`, refused at load rather than clamped. Above retention, discovery downloads what purge deletes. Below retention is coverage deliberately traded for frequency — allowed, and paid for by the watermark rule.
+
+**A sweep that does not reach the retention frontier may not advance the watermark**, and whether it did is derived from the two windows (`window.first <= retention.first`), never from the profile flag. A narrow sweep observed nothing about the days it skipped; recording its last day would assert full coverage over days nobody asked about and leave the only gap alarm the archive has permanently green. The intended consequence: stop running the daily sweep and `check_watermarks` starts warning every run.
+
+**A narrower window does not mean fewer requests here.** Discovery is one query per entity covering the whole window, so a monitor firing costs roughly one request per monitored fund — the same as a sweep firing. What the narrow profile buys is freshness and a skipped audit, not a cheaper listing. This is the one place the design diverges in effect from `co-docs-watcher`, whose discovery is a global listing *per day* and where a narrower window genuinely removes requests. Any argument about cost has to start from the per-entity shape.
+
+`docker/scheduler.py` drives both from `MONITOR_SCHEDULE`/`MONITOR_ENABLED` and `SWEEP_SCHEDULE`/`SWEEP_ENABLED`, with `RUN_ON_START` naming the catch-up profile (`sweep`, because a start follows a restart or downtime — the gap case, which the monitor cannot see). The loop is serial, so a firing landing mid-run is skipped rather than queued and the profiles never contend for the lock; when both match one minute the sweep wins, being the superset. `RUN_SCHEDULE` and `RUN_ON_START=true|false` are the retired spellings, still read as `SWEEP_SCHEDULE` and `sweep|none` and warned about: a deployment already running must not be silently rescheduled.
 
 ## Only the live version is kept
 
@@ -127,7 +143,7 @@ Section pointers refer to `arquitetura-fii-monitor-pipeline-a-rev3.md`.
 
 - **Publication identity is `(document_id, version)`** — never the document id alone. That pair is the key for dedupe, idempotency, and the filename. The content hash serves integrity and audit and is **never** the dedupe key (§2.4).
 - **Discovery queries per entity with `idFundo`** — never by matching `descricaoFundo` text. The listing returns `cnpjFundo` and `idFundo` as `null` on every row, even when filtering by `idFundo`, so text routing is a silent failure mode; revision 3 reverted to per-entity queries precisely to kill it (§2.3, §4.1). The global listing is **detective-only audit**: it raises alerts, never routes a document into the archive and never serves as a discovery path (§4.5).
-- **Every run queries the whole retention window** `[today - (N-1), today]` per entity. There is no incremental interval. The watermark records completed progress and raises alerts; it is not an input to the interval calculation (§4.2, §4.3).
+- **Every run queries its whole discovery window** `[today - (N-1), today]` per entity. There is no incremental interval. The watermark records completed progress and raises alerts; it is not an input to the interval calculation (§4.2, §4.3). Two windows exist and both end on the same `today`: purge, the inbox and the frontier keep the **retention** window, while discovery sweeps `[discovery].days` under `run` and `[discovery].monitor_days` under `run --monitor` — see "Two run profiles" below.
 - **Rediscovered documents update mutable fields and never trigger a re-download.** `status` in the manifest means "last state observed inside the retention window" (§4.2).
 - **The stored extension is decided by the actual response**, in this order of confidence: content signature (decisive) > `Content-Disposition` > `Content-Type` (least reliable). The "Estruturado" heuristic is for *early routing* only (§2.5).
 - **Validate content; a successful parse is not enough.** Recognize PDF by the `%PDF-` signature; require a plausible root for XML; explicitly reject an `html` root and error-page bodies even when well-formed; parse with external entity resolution disabled; cap response size; treat unrecognized content as a noisy failure and never write it silently. HTTP 200 with an HTML error body is a real failure mode in this system (§2.5, §8).

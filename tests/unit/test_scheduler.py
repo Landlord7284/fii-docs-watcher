@@ -50,10 +50,18 @@ def _fires_at(expression: str, year: int, month: int, day: int) -> list[str]:
 
 
 class TestParsing:
-    def test_the_default_fires_three_times_a_day(self) -> None:
-        # `0 8/6 * * *` -- the bare-step form, which is what makes 8/6 mean
-        # "from 8, every 6 hours" rather than a fraction.
-        assert _fires_at(scheduler.DEFAULT_SCHEDULE, 2026, 8, 14) == ["08:00", "14:00", "20:00"]
+    def test_the_bare_step_form(self) -> None:
+        # `0 8/6 * * *` -- what makes 8/6 mean "from 8, every 6 hours" rather
+        # than a fraction. It was the shipped default before the profiles
+        # existed and is still what a deployment may carry in its .env.
+        assert _fires_at("0 8/6 * * *", 2026, 8, 14) == ["08:00", "14:00", "20:00"]
+
+    def test_the_shipped_sweep_fires_once_a_day(self) -> None:
+        assert _fires_at(scheduler.DEFAULT_SWEEP_SCHEDULE, 2026, 8, 14) == ["05:10"]
+
+    def test_the_shipped_monitor_fires_through_the_publishing_day(self) -> None:
+        hits = _fires_at(scheduler.DEFAULT_MONITOR_SCHEDULE, 2026, 8, 14)
+        assert hits[0] == "07:00" and hits[-1] == "23:00" and len(hits) == 17
 
     def test_a_plain_time(self) -> None:
         assert _fires_at("30 8 * * *", 2026, 8, 14) == ["08:30"]
@@ -226,3 +234,115 @@ class TestTheHostTimezoneIsIrrelevant:
         schedule = Schedule.parse("0 22 14 * *")
         assert schedule.matches(in_source)
         assert not schedule.matches(in_host)
+
+
+class TestProfiles:
+    """Two schedules, one loop, and a deployment that predates both."""
+
+    @pytest.fixture(autouse=True)
+    def clean_environment(self, monkeypatch: pytest.MonkeyPatch):
+        for name in (
+            "MONITOR_SCHEDULE",
+            "MONITOR_ENABLED",
+            "SWEEP_SCHEDULE",
+            "SWEEP_ENABLED",
+            "RUN_SCHEDULE",
+            "RUN_ON_START",
+        ):
+            monkeypatch.delenv(name, raising=False)
+        return monkeypatch
+
+    def _due(self, hour: int, minute: int, **schedules) -> str | None:
+        parsed = {
+            profile: (None if expression is None else Schedule.parse(expression))
+            for profile, expression in schedules.items()
+        }
+        moment = datetime(2026, 8, 14, hour, minute, tzinfo=ZoneInfo("America/Sao_Paulo"))
+        return scheduler.due(parsed, moment)
+
+    def test_each_profile_fires_on_its_own_schedule(self) -> None:
+        assert self._due(5, 10, sweep="10 5 * * *", monitor="0 7-23 * * *") == "sweep"
+        assert self._due(9, 0, sweep="10 5 * * *", monitor="0 7-23 * * *") == "monitor"
+        assert self._due(6, 0, sweep="10 5 * * *", monitor="0 7-23 * * *") is None
+
+    def test_the_sweep_wins_a_minute_they_share(self) -> None:
+        # It covers every date the monitor would, and the loop is serial, so
+        # running both would be one wasted pass over the same days.
+        assert self._due(5, 10, sweep="10 5 * * *", monitor="10 5 * * *") == "sweep"
+
+    def test_a_disabled_profile_never_fires(self) -> None:
+        assert self._due(9, 0, sweep=None, monitor="0 7-23 * * *") == "monitor"
+        assert self._due(9, 0, sweep="10 5 * * *", monitor=None) is None
+
+    def test_each_profile_spawns_the_command_that_belongs_to_it(self) -> None:
+        # A profile name on the schedule, never a number: retuning how many
+        # days it covers has to stay an edit to config.toml.
+        assert scheduler.PROFILE_ARGUMENTS["sweep"] == ("run",)
+        assert scheduler.PROFILE_ARGUMENTS["monitor"] == ("run", "--monitor")
+
+    def test_the_enabled_flags_default_to_on(self, clean_environment) -> None:
+        assert scheduler._schedule_for("monitor", "", "0 7-23 * * *") is not None
+
+    def test_a_profile_can_be_switched_off(self, clean_environment) -> None:
+        clean_environment.setenv("MONITOR_ENABLED", "false")
+        assert scheduler._schedule_for("monitor", "", "0 7-23 * * *") is None
+
+
+class TestTheDeploymentThatPredatesTheProfiles:
+    """RUN_SCHEDULE and RUN_ON_START=true are live in somebody's .env.
+
+    What they named -- the whole run, audit included -- is now the sweep. They
+    are read rather than ignored, because silently rescheduling a running
+    archive is the failure this project refuses everywhere else.
+    """
+
+    @pytest.fixture(autouse=True)
+    def clean_environment(self, monkeypatch: pytest.MonkeyPatch):
+        for name in ("SWEEP_SCHEDULE", "SWEEP_ENABLED", "RUN_SCHEDULE", "RUN_ON_START"):
+            monkeypatch.delenv(name, raising=False)
+        return monkeypatch
+
+    def test_run_schedule_is_read_as_the_sweep(self, clean_environment) -> None:
+        clean_environment.setenv("RUN_SCHEDULE", "0 8/6 * * *")
+        schedule = scheduler._sweep_schedule()
+        assert schedule is not None and schedule.text == "0 8/6 * * *"
+
+    def test_the_new_name_wins_when_both_agree(self, clean_environment) -> None:
+        clean_environment.setenv("RUN_SCHEDULE", "0 6 * * *")
+        clean_environment.setenv("SWEEP_SCHEDULE", "0 6 * * *")
+        assert scheduler._sweep_schedule().text == "0 6 * * *"
+
+    def test_two_disagreeing_answers_are_refused(self, clean_environment) -> None:
+        # Not resolved by preference: an operator who set both believes one of
+        # them, and picking silently is how a schedule drifts.
+        clean_environment.setenv("RUN_SCHEDULE", "0 6 * * *")
+        clean_environment.setenv("SWEEP_SCHEDULE", "0 7 * * *")
+        with pytest.raises(scheduler.ScheduleError, match="retired spelling"):
+            scheduler._sweep_schedule()
+
+    def test_the_default_applies_when_neither_is_set(self, clean_environment) -> None:
+        assert scheduler._sweep_schedule().text == scheduler.DEFAULT_SWEEP_SCHEDULE
+
+    def test_run_on_start_defaults_to_the_sweep(self, clean_environment) -> None:
+        # A start usually follows a restart, an update or downtime -- the gap
+        # case, which the monitor's narrow window cannot see.
+        assert scheduler._run_on_start() == "sweep"
+
+    def test_the_boolean_spellings_still_mean_what_they_meant(
+        self, clean_environment
+    ) -> None:
+        clean_environment.setenv("RUN_ON_START", "true")
+        assert scheduler._run_on_start() == "sweep"
+        clean_environment.setenv("RUN_ON_START", "false")
+        assert scheduler._run_on_start() == "none"
+
+    def test_a_profile_name_is_taken_as_written(self, clean_environment) -> None:
+        clean_environment.setenv("RUN_ON_START", "monitor")
+        assert scheduler._run_on_start() == "monitor"
+        clean_environment.setenv("RUN_ON_START", "none")
+        assert scheduler._run_on_start() == "none"
+
+    def test_anything_else_is_refused(self, clean_environment) -> None:
+        clean_environment.setenv("RUN_ON_START", "hourly")
+        with pytest.raises(scheduler.ScheduleError, match="sweep, monitor or none"):
+            scheduler._run_on_start()

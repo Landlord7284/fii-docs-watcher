@@ -160,6 +160,10 @@ class FakeFnet:
         self.disposition: dict[int, str] = {}
         self.request_log: list[str] = []
         self.fail_downloads: set[int] = set()
+        # Forces `recordsFiltered` to disagree with what is actually served,
+        # which is how a short scan looks on the wire: the source claims more
+        # records than pagination ever hands over. See §9.5.
+        self.records_filtered_override: int | None = None
 
     # ------------------------------------------------------------------ setup
 
@@ -233,7 +237,11 @@ class FakeFnet:
             json={
                 "draw": int(params.get("d", 1)),
                 "recordsTotal": len(rows),
-                "recordsFiltered": len(rows),
+                "recordsFiltered": (
+                    len(rows)
+                    if self.records_filtered_override is None
+                    else self.records_filtered_override
+                ),
                 "data": page,
             },
         )

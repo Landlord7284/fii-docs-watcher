@@ -30,11 +30,12 @@ fii-docs-watcher run
 Then open `documents_root/_inbox/<today>.md` for what arrived today, or the dated directories for
 what was published on a given day.
 
-To keep it current, schedule `run` daily — cron, a systemd timer, whatever you already use. It
-takes no arguments and exits with a meaningful code.
+To keep it current, schedule two profiles — cron, a systemd timer, whatever you already use. Each
+takes a profile flag and no numbers, and exits with a meaningful code.
 
 ```cron
-30 8 * * *  cd /srv/fii && /srv/fii/.venv/bin/fii-docs-watcher run >> /var/log/fii.log 2>&1
+10 5 * * *     cd /srv/fii && /srv/fii/.venv/bin/fii-docs-watcher run >> /var/log/fii.log 2>&1
+0 7-23 * * *   cd /srv/fii && /srv/fii/.venv/bin/fii-docs-watcher run --monitor >> /var/log/fii.log 2>&1
 ```
 
 ### With Docker
@@ -45,8 +46,8 @@ cp .env.example .env
 docker compose up -d
 ```
 
-The container schedules the same one-shot `run` for you, so there is no cron line. Everything else
-is one invocation at a time:
+The container schedules both profiles of the same one-shot `run` for you, so there is no cron line.
+Everything else is one invocation at a time:
 
 ```bash
 docker compose run --rm watcher doctor
@@ -74,12 +75,25 @@ holds only what has no place in it:
 | `IMAGE_TAG` | Which published image to run. Pin a version to make updates deliberate. |
 | `DOCUMENTS_PATH` | Where the archive lands on the host. This is the directory you share. |
 | `PUID` / `PGID` | The uid and gid that own what the robot writes. |
-| `RUN_SCHEDULE` | When to run: a 5-field cron expression, default `0 8/6 * * *` (08:00, 14:00, 20:00). |
-| `RUN_ON_START` | Run once at startup rather than waiting for the first scheduled time. |
+| `MONITOR_SCHEDULE` | When `run --monitor` fires: a 5-field cron expression, default `0 7-23 * * *`. |
+| `MONITOR_ENABLED` | `false` drops the monitor entirely. |
+| `SWEEP_SCHEDULE` | When `run` fires, default `10 5 * * *`. |
+| `SWEEP_ENABLED` | `false` drops the sweep entirely. |
+| `RUN_ON_START` | Which profile a container start runs: `sweep`, `monitor` or `none`. |
 
-`RUN_SCHEDULE` is read in the source's timezone, the same one directory names use, so a time here
-means what a directory name means. It takes five fields, not the six-field form whose first field
-is seconds.
+Schedules live here; how many days each profile covers lives in `[discovery]` in `config.toml` —
+how often to look and how far back are different questions, and a change of cadence should not read
+like a change of coverage. Both expressions are read in the source's timezone, the same one
+directory names use, so a time here means what a directory name means. Five fields, not the
+six-field form whose first field is seconds.
+
+The catch-up on start is the sweep, because a container start usually follows a restart, an update
+or downtime — the gap case, and the one the monitor's narrow window cannot see. Disabling both
+profiles is refused: a scheduler that would fire nothing is a container pretending to work.
+
+`RUN_SCHEDULE` and `RUN_ON_START=true|false` are the retired spellings. They are still read — as
+`SWEEP_SCHEDULE` and `sweep|none` — and warned about, so an existing deployment keeps firing when it
+always did.
 
 Two constraints the compose file already satisfies, worth knowing before you change it:
 
@@ -123,6 +137,8 @@ FII_WATCHER_DOWNLOAD_FORMATS=xml fii-docs-watcher run
 | `paths.data_root` | `./var/data` | Private state: `funds.yaml`, `manifest.sqlite`, the lock, the CVM cache. **Must be on a local filesystem** — SQLite over SMB/NFS is not safe. |
 | `paths.documents_root` | `./var/documents` | The archive. This is the one you share. |
 | `retention.days` | `7` | Dates kept, **including today**. `N=7` on the 14th keeps the 8th to the 14th. |
+| `discovery.days` | follows `retention.days` | Dates swept by `run`. Never more than `retention.days`. |
+| `discovery.monitor_days` | `2` | Dates swept by `run --monitor`. Never more than `discovery.days`. |
 | `download.formats` | `["pdf"]` | Which formats to keep. XML is opt-in. See [Choosing formats](#choosing-formats). |
 | `download.stale_part_hours` | `6` | Age at which an orphaned `.part` file is swept. |
 | `source.timezone` | `America/Sao_Paulo` | The zone the source publishes in, and therefore what "today" means for directory names, the retention frontier and the index. Never read from the host. The default is correct for Fundos.NET; changing it on an existing archive re-dates everything downloaded afterwards. |
@@ -163,20 +179,34 @@ and the next `run` picks them up without needing to rediscover them.
 
 Every command accepts `--config PATH` and `--verbose`, before or after the command name.
 
-### `run`
+### `run [--monitor]`
 
 Runs the pipeline once and exits. **This is the only command a scheduler needs.**
 
 In order: reconcile whatever a previous run left half-done → refresh the CVM registry snapshot →
-resolve any scope that needs it → query the whole retention window per entity → download what is
+resolve any scope that needs it → query the discovery window per entity → download what is
 new → delete any version a re-filing has replaced → write the inbox index → purge past the frontier
 → run the global audit.
 
 ```bash
 fii-docs-watcher run
+fii-docs-watcher run --monitor      # the frequent profile
 fii-docs-watcher run --dry-run      # resolve scopes, stop before discovery
 fii-docs-watcher run --skip-audit
 ```
+
+There are two profiles. Plain `run` sweeps `discovery.days` (which follows `retention.days` unless
+you say otherwise) and runs the global audit. `run --monitor` sweeps the narrower
+`discovery.monitor_days` and skips the audit, so it is cheap enough to schedule often. They differ
+in nothing else: the same queue is drained, the same index written, and purge and the retention
+frontier stay on `retention.days` in both.
+
+The daily sweep is worth keeping even under a frequent monitor, because frequency is not coverage: a
+two-day window sees today and yesterday however often it fires. What the sweep buys is the days a
+longer outage swallowed, and re-filings of documents already archived — those keep their original
+delivery date at the source, so only a query of the older day finds them. Accordingly, only a sweep
+that reaches the retention frontier records progress; a monitor leaves the watermark alone and
+`status` keeps reporting the gap.
 
 Safe to run as often as you like. Rediscovering a document refreshes its status and never downloads
 it again.
@@ -312,7 +342,7 @@ that discovery did not capture.
 
 ### `status`
 
-Retention window, document counts by state, and any entity whose last complete scan predates the
+Retention window, both discovery windows and which profile sweeps each, document counts by state, and any entity whose last complete scan predates the
 retention frontier — documents in such a gap were published and purged without ever being seen, and
 cannot be recovered.
 
@@ -324,7 +354,9 @@ list) · `purged` (aged out; the row is kept, the file is not).
 
 Checks everything a run depends on: which config file was resolved, both roots writable, staging on
 the same filesystem as the archive (or `rename` would not be atomic), the manifest openable, and
-both sources reachable. **Run this first on a new machine.**
+both sources reachable. It also prints both discovery windows resolved against today, so what each
+profile will ask for is verifiable without spending a sweep to find out. **Run this first on a new
+machine.**
 
 ### `reconcile`, `purge`, `audit`
 

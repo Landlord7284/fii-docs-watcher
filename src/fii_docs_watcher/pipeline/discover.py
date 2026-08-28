@@ -57,6 +57,7 @@ def discover_entity(
     window: RetentionWindow,
     page_length: int,
     report: DiscoveryReport,
+    covers_retention: bool = True,
 ) -> None:
     """Scan one entity's window and persist what it found.
 
@@ -65,6 +66,12 @@ def discover_entity(
     ordering is deliberate: it satisfies "documents are durable before the
     watermark moves" without holding a database transaction open across network
     calls.
+
+    `covers_retention` says whether this sweep reached the retention frontier.
+    Only one that did may write the watermark: a narrower sweep observed
+    nothing about the days it skipped, and recording its last day would assert
+    "everything through today has been seen" over days nobody asked about --
+    turning the only gap alarm the archive has permanently green.
     """
     result = scan(
         client,
@@ -93,9 +100,9 @@ def discover_entity(
             ):
                 new_count += 1
 
-        if result.complete:
+        if result.complete and covers_retention:
             repo.advance_watermark(entity.fundosnet_id, window.last)
-        else:
+        elif not result.complete:
             report.incomplete_scans += 1
             repo.record_entity_error(
                 entity.fundosnet_id,
@@ -113,6 +120,7 @@ def discover_entity(
             "new": new_count,
             "pages": result.pages,
             "complete": result.complete,
+            "watermark_advanced": result.complete and covers_retention,
         },
     )
 
@@ -125,13 +133,22 @@ def run(
     *,
     page_length: int,
     should_stop: object = None,
+    retention: RetentionWindow | None = None,
 ) -> DiscoveryReport:
     """Discover across every entity of every scope.
 
     A failing entity is recorded and skipped; the rest of the batch continues.
     One misconfigured fund must never cost a day of everyone else's documents.
+
+    `window` is the sweep's own window, which the monitor profile deliberately
+    makes narrower than retention. `retention` is the window the archive
+    promises to hold; whether the watermark may advance is derived from the two
+    of them and never from a profile flag, so the rule cannot drift away from
+    the numbers it is about. Omitting it says this sweep *is* the retention
+    sweep, which is what every caller before the profiles existed meant.
     """
     report = DiscoveryReport()
+    covers_retention = retention is None or window.first <= retention.first
 
     for scope in scopes:
         if not scope.resolved:
@@ -153,6 +170,7 @@ def run(
                     window=window,
                     page_length=page_length,
                     report=report,
+                    covers_retention=covers_retention,
                 )
                 report.entities_scanned += 1
             except (TransientSourceError, WatcherError) as exc:

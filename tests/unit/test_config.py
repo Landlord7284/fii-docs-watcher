@@ -9,6 +9,7 @@ import pytest
 from fii_docs_watcher.clock import DEFAULT_TIMEZONE, set_timezone, source_tz
 from fii_docs_watcher.config import (
     CONFIG_SEARCH_PATH,
+    DEFAULT_MONITOR_DAYS,
     ENV_CONFIG_PATH,
     MAX_PAGE_LENGTH,
     describe_source,
@@ -149,6 +150,70 @@ class TestFormats:
         (isolated / "config.toml").write_text('[download]\nformats = ["doc"]\n')
         with pytest.raises(ConfigError, match="doc"):
             load()
+
+
+class TestDiscoveryWindows:
+    """The two sweep widths, and the ordering that keeps them honest."""
+
+    def test_both_default_to_something_usable_with_no_config(self) -> None:
+        config = load()
+        assert config.discovery.days == config.retention.days
+        assert config.discovery.monitor_days == DEFAULT_MONITOR_DAYS
+
+    def test_days_follows_retention_when_unset(self, isolated: Path) -> None:
+        # A file that names neither keeps a single window and behaves exactly
+        # as it did before the profiles existed.
+        (isolated / "config.toml").write_text("[retention]\ndays = 30\n")
+        config = load()
+        assert config.sweep_days(monitor=False) == 30
+        assert config.sweep_days(monitor=True) == DEFAULT_MONITOR_DAYS
+
+    def test_the_monitor_default_is_narrowed_to_fit_a_one_day_archive(
+        self, isolated: Path
+    ) -> None:
+        (isolated / "config.toml").write_text("[retention]\ndays = 1\n")
+        assert load().sweep_days(monitor=True) == 1
+
+    def test_both_can_be_declared(self, isolated: Path) -> None:
+        (isolated / "config.toml").write_text(
+            "[retention]\ndays = 10\n\n[discovery]\ndays = 5\nmonitor_days = 3\n"
+        )
+        config = load()
+        assert (config.sweep_days(monitor=False), config.sweep_days(monitor=True)) == (5, 3)
+
+    def test_a_sweep_wider_than_retention_is_refused(self, isolated: Path) -> None:
+        # Not clamped: it would rediscover on Wednesday what purge deleted on
+        # Tuesday, every week, and the archive would churn forever.
+        (isolated / "config.toml").write_text("[retention]\ndays = 7\n\n[discovery]\ndays = 8\n")
+        with pytest.raises(ConfigError, match="purge has already deleted"):
+            load()
+
+    def test_a_monitor_wider_than_the_sweep_is_refused(self, isolated: Path) -> None:
+        (isolated / "config.toml").write_text(
+            "[retention]\ndays = 7\n\n[discovery]\ndays = 3\nmonitor_days = 4\n"
+        )
+        with pytest.raises(ConfigError, match="narrower of the two profiles"):
+            load()
+
+    def test_a_written_monitor_value_is_validated_rather_than_clamped(
+        self, isolated: Path
+    ) -> None:
+        # The default is narrowed to fit; a value somebody typed is not, or the
+        # configuration would silently mean something other than what it says.
+        (isolated / "config.toml").write_text(
+            "[retention]\ndays = 1\n\n[discovery]\nmonitor_days = 2\n"
+        )
+        with pytest.raises(ConfigError):
+            load()
+
+    def test_zero_is_refused_for_either(self, isolated: Path) -> None:
+        (isolated / "config.toml").write_text("[discovery]\nmonitor_days = 0\n")
+        with pytest.raises(ConfigError, match=r"\[discovery\].monitor_days must be >= 1"):
+            load()
+
+    def test_the_environment_can_override_them(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("FII_WATCHER_DISCOVERY_MONITOR_DAYS", "3")
+        assert load().sweep_days(monitor=True) == 3
 
 
 class TestValidation:

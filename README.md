@@ -43,10 +43,12 @@ Then set `paths.data_root` (private state — must be on a local filesystem) and
 fii-docs-watcher doctor                # check config, roots and both sources
 fii-docs-watcher add --cnpj 12.345.678/0001-90 --ticker ABCD11
 fii-docs-watcher run                   # the canonical one-shot mode
+fii-docs-watcher run --monitor         # the frequent profile: a narrower window, no audit
 ```
 
-Then open `documents_root/_inbox/<today>.md`. Schedule `run` daily with cron or a timer; it takes no
-arguments and exits `0` clean, `1` isolated failure, `2` bad configuration, `3` already running.
+Then open `documents_root/_inbox/<today>.md`. Schedule the daily `run` and, if you want documents
+sooner than once a day, a frequent `run --monitor` beside it. Both take a profile and never a
+number, and exit `0` clean, `1` isolated failure, `2` bad configuration, `3` already running.
 
 Runs taking minutes is normal — the source answers in either ~0.3s or ~60s, with nothing in between.
 
@@ -62,8 +64,9 @@ docker compose up -d
 image tag, the host directory for the archive, the uid that owns it, and the schedule. There is no
 second set of settings to find.
 
-The container runs the same one-shot `run` on a schedule (`RUN_SCHEDULE`, a cron expression,
-default 08:00/14:00/20:00). Every other command is still one invocation:
+The container runs both profiles of the same one-shot `run` on schedules of their own
+(`SWEEP_SCHEDULE`, daily; `MONITOR_SCHEDULE`, hourly through the publishing day). Every other
+command is still one invocation:
 
 ```bash
 docker compose run --rm watcher doctor

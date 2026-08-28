@@ -62,6 +62,11 @@ MAX_PAGE_LENGTH = 200
 # `downloadDocumento` serves exactly these two, from the same endpoint.
 SUPPORTED_FORMATS = frozenset({"pdf", "xml"})
 
+# Dates swept by `run --monitor`, counting today. Two, because a document
+# delivered late yesterday must still be caught by a monitor whose last firing
+# was before it arrived.
+DEFAULT_MONITOR_DAYS = 2
+
 
 @dataclass(frozen=True)
 class PathsConfig:
@@ -106,6 +111,27 @@ class PathsConfig:
 @dataclass(frozen=True)
 class RetentionConfig:
     days: int = 7
+
+
+@dataclass(frozen=True)
+class DiscoveryConfig:
+    """How many dates each of the two run profiles sweeps.
+
+    Both are `None` as declared and filled in by `Config.__post_init__`, so a
+    file that names neither keeps a single window and behaves exactly as it did
+    before the profiles existed. `Config.sweep_days()` is what the pipeline
+    reads, and it always answers with a concrete integer.
+
+    The ordering `1 <= monitor_days <= days <= retention.days` is enforced in
+    `_validate`, and the upper bound is refused rather than clamped: a sweep
+    wider than retention rediscovers on Wednesday what purge deleted on
+    Tuesday, forever. A sweep *narrower* than retention is coverage traded for
+    frequency, which is allowed on purpose -- and is why it may not advance the
+    watermark.
+    """
+
+    days: int | None = None
+    monitor_days: int | None = None
 
 
 @dataclass(frozen=True)
@@ -178,6 +204,7 @@ class LoggingConfig:
 class Config:
     paths: PathsConfig = field(default_factory=PathsConfig)
     retention: RetentionConfig = field(default_factory=RetentionConfig)
+    discovery: DiscoveryConfig = field(default_factory=DiscoveryConfig)
     source: SourceConfig = field(default_factory=SourceConfig)
     cvm: CvmConfig = field(default_factory=CvmConfig)
     audit: AuditConfig = field(default_factory=AuditConfig)
@@ -189,10 +216,47 @@ class Config:
     source_path: Path | None = None
     logging: LoggingConfig = field(default_factory=LoggingConfig)
 
+    def __post_init__(self) -> None:
+        """Fill in whichever of the two sweep widths was left unsaid.
+
+        Resolved here rather than in `load()` so that every `Config` carries
+        concrete numbers, however it was built -- and so `doctor`, the run log
+        and `sweep_days()` all read one answer instead of re-deriving the
+        fallback separately and eventually disagreeing.
+
+        `days` follows `[retention].days`, which is what the robot did before
+        the profiles existed. `monitor_days` follows `DEFAULT_MONITOR_DAYS`
+        narrowed to fit, because a one-day archive names no monitor window and
+        must stay valid. Only the default is narrowed: a written value is
+        validated, never quietly clamped.
+        """
+        days = self.discovery.days
+        if days is None:
+            days = self.retention.days
+        monitor_days = self.discovery.monitor_days
+        if monitor_days is None:
+            monitor_days = min(DEFAULT_MONITOR_DAYS, days)
+        if (days, monitor_days) != (self.discovery.days, self.discovery.monitor_days):
+            object.__setattr__(
+                self, "discovery", DiscoveryConfig(days=days, monitor_days=monitor_days)
+            )
+
+    def sweep_days(self, *, monitor: bool) -> int:
+        """How many dates the requested profile sweeps.
+
+        The profile selects which configured integer becomes the discovery
+        window and nothing else. Answered here so that no caller does the
+        arithmetic and no `if monitor:` exists below the composition root.
+        """
+        days = self.discovery.monitor_days if monitor else self.discovery.days
+        assert days is not None  # Resolved in __post_init__ for every Config.
+        return days
+
 
 _SECTIONS: dict[str, type] = {
     "paths": PathsConfig,
     "retention": RetentionConfig,
+    "discovery": DiscoveryConfig,
     "source": SourceConfig,
     "cvm": CvmConfig,
     "audit": AuditConfig,
@@ -354,10 +418,37 @@ def describe_source(config: Config) -> str:
     )
 
 
+def _validate_discovery(config: Config) -> None:
+    """The two sweep widths, ordered `1 <= monitor_days <= days <= retention.days`.
+
+    Both bounds are errors rather than warnings. Above retention, discovery
+    downloads what purge is about to delete and the archive churns forever.
+    Below one, a profile sweeps nothing at all while still looking like it ran.
+    """
+    days = config.sweep_days(monitor=False)
+    monitor_days = config.sweep_days(monitor=True)
+    if days < 1:
+        raise ConfigError(f"[discovery].days must be >= 1, got {days}")
+    if monitor_days < 1:
+        raise ConfigError(f"[discovery].monitor_days must be >= 1, got {monitor_days}")
+    if days > config.retention.days:
+        raise ConfigError(
+            f"[discovery].days is {days}, more than [retention].days "
+            f"({config.retention.days}): a sweep wider than retention would rediscover "
+            "documents that purge has already deleted"
+        )
+    if monitor_days > days:
+        raise ConfigError(
+            f"[discovery].monitor_days is {monitor_days}, more than [discovery].days "
+            f"({days}): the monitor is the narrower of the two profiles"
+        )
+
+
 def _validate(config: Config) -> None:
     """Reject configurations that cannot work, before any side effect happens."""
     if config.retention.days < 1:
         raise ConfigError(f"[retention].days must be >= 1, got {config.retention.days}")
+    _validate_discovery(config)
     if config.source.page_length < 1:
         raise ConfigError(f"[source].page_length must be >= 1, got {config.source.page_length}")
     if config.source.page_length > MAX_PAGE_LENGTH:

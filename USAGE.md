@@ -31,7 +31,9 @@ Then open `documents_root/_inbox/<today>.md` for what arrived today, or the date
 what was published on a given day.
 
 To keep it current, schedule two profiles — cron, a systemd timer, whatever you already use. Each
-takes a profile flag and no numbers, and exits with a meaningful code.
+takes a profile flag and no numbers, and exits with a meaningful code. `run` is the daily sweep;
+`run --monitor` is a cheap frequent check that only queries funds with something new, and it relies
+on the daily sweep as its backstop — schedule both.
 
 ```cron
 10 5 * * *     cd /srv/fii && /srv/fii/.venv/bin/fii-docs-watcher run >> /var/log/fii.log 2>&1
@@ -76,7 +78,7 @@ holds only what has no place in it:
 | `DOCUMENTS_PATH` | Where the archive lands on the host. This is the directory you share. |
 | `PUID` / `PGID` | The uid and gid that own what the robot writes. |
 | `MONITOR_SCHEDULE` | When `run --monitor` fires: a 5-field cron expression, default `0 7-23 * * *`. |
-| `MONITOR_ENABLED` | `false` drops the monitor entirely. |
+| `MONITOR_ENABLED` | `false` drops the monitor entirely. Enabling it requires the sweep to stay enabled. |
 | `SWEEP_SCHEDULE` | When `run` fires, default `10 5 * * *`. |
 | `SWEEP_ENABLED` | `false` drops the sweep entirely. |
 | `RUN_ON_START` | Which profile a container start runs: `sweep`, `monitor` or `none`. |

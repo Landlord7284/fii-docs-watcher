@@ -87,7 +87,7 @@ alias fii='docker compose -f /path/to/compose.yaml exec -u 1000:1000 watcher fii
 
 - **[USAGE.md](USAGE.md)** — the full command reference: every subcommand, every setting,
   what lands on disk, and troubleshooting.
-- `arquitetura-fii-monitor-pipeline-a-rev3.md` — the architecture specification (in Portuguese),
+- `arquitetura-fii-monitor-pipeline-a-rev4.md` — the architecture specification (in Portuguese),
   which is the authority on behaviour.
 
 ## Tests

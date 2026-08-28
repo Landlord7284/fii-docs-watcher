@@ -30,14 +30,17 @@ days = 7
 # deleted, so it is refused rather than trimmed.
 days = 7
 
-# `monitor_days` is what `run --monitor` sweeps -- the frequent profile, which
-# also skips the global audit. Two dates, so a document delivered late
-# yesterday is still caught by a monitor that last fired before it arrived.
+# `monitor_days` is the window of `run --monitor` -- the frequent profile,
+# which reads the source's listing newest-first, stops at what it has already
+# accounted for, queries per entity only the funds that actually filed, and
+# skips the global audit. Two dates, so a document delivered late yesterday is
+# still caught by a monitor that last fired before it arrived.
 #
 # Narrower than retention is coverage traded for frequency, and it is traded
 # honestly: a monitor never records progress, so the staleness warning keeps
 # firing until a full sweep actually covers those days. Schedule a daily `run`
-# beside the monitor -- a re-filing of an older document keeps its original
+# beside the monitor -- it is the backstop for anything the monitor's name
+# matching misses, and a re-filing of an older document keeps its original
 # delivery date at the source, so only a query of that older day finds it.
 monitor_days = 2
 

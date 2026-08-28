@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project state
 
-`arquitetura-fii-monitor-pipeline-a-rev3.md` is the architecture and boundary-conditions document (revision 3) for **Pipeline A** — a robot that downloads Brazilian real-estate fund (FII) documents daily from Fundos.NET and files them into per-day directories for human reading, over a sliding N-day retention window.
+`arquitetura-fii-monitor-pipeline-a-rev4.md` is the architecture and boundary-conditions document (revision 4; revision 3 is preserved beside it as history) for **Pipeline A** — a robot that downloads Brazilian real-estate fund (FII) documents daily from Fundos.NET and files them into per-day directories for human reading, over a sliding N-day retention window.
 
 Pipeline A is implemented in Python 3.12+ under `src/fii_docs_watcher/`, with three dependencies: `httpx`, `ruamel.yaml` (because §3.6 requires comments to survive a rewrite, which PyYAML cannot do) and `tzdata` (because `clock` resolves a zone at import time and a minimal Linux image ships no IANA database, making it a crash before any error handling runs). Everything else is standard library.
 
@@ -70,16 +70,21 @@ Consequences worth knowing:
 
 ## Two run profiles over one archive
 
-`run` is the daily sweep; `run --monitor` is the frequent profile. The flag carries a **profile, never a number** — a cron line says which profile sweeps, so retuning a window stays a configuration edit. Two things differ between them and nothing else:
+`run` is the daily sweep; `run --monitor` is the frequent profile. The flag carries a **profile, never a number** — a cron line says which profile sweeps, so retuning a window stays a configuration edit. Three things differ between them and nothing else:
 
 - the discovery window, `[discovery].days` against `[discovery].monitor_days`, chosen once by `config.sweep_days(monitor=)` so that no `if monitor:` exists below `run.execute`;
+- the discovery *mechanism* — the sweep queries every entity (`discover.run`), the monitor discovers through the listing gate (`discover.run_monitor`, below); the choice between them is the composition root's one profile decision;
 - the global audit, which the monitor declines. It is a scan of the whole day's listing per fund type — the costliest request a run makes, and detective-only — and `audit.should_run` is calendar-driven, so `frequency = "daily"` would otherwise fire it on every firing of a frequent profile.
 
 `1 <= monitor_days <= days <= retention.days`, refused at load rather than clamped. Above retention, discovery downloads what purge deletes. Below retention is coverage deliberately traded for frequency — allowed, and paid for by the watermark rule.
 
 **A sweep that does not reach the retention frontier may not advance the watermark**, and whether it did is derived from the two windows (`window.first <= retention.first`), never from the profile flag. A narrow sweep observed nothing about the days it skipped; recording its last day would assert full coverage over days nobody asked about and leave the only gap alarm the archive has permanently green. The intended consequence: stop running the daily sweep and `check_watermarks` starts warning every run.
 
-**A narrower window does not mean fewer requests here.** Discovery is one query per entity covering the whole window, so a monitor firing costs roughly one request per monitored fund — the same as a sweep firing. What the narrow profile buys is freshness and a skipped audit, not a cheaper listing. This is the one place the design diverges in effect from `co-docs-watcher`, whose discovery is a global listing *per day* and where a narrower window genuinely removes requests. Any argument about cost has to start from the per-entity shape.
+**The monitor discovers through the listing gate** (§4.7, the stated exception to §4.5): *the listing gates which per-entity queries the monitor spends; it never routes a document.* Narrowing the window alone would not have made the monitor cheaper — per-entity discovery covers any window in one request, so that shape costs `entities × firings`. Instead, per fund type in the watch list, `listing.scan_newest` reads the global listing newest-first (`o[0][dataEntrega]=desc`, measured clean 2026-08-27 and pinned by a live test) and stops at the first row below the `listing_cursor` for that type (manifest schema v3; rows tied at the cursor minute are kept — dedup is on `(id, versao)`, never the timestamp). New rows are folded and matched **exactly** against the monitored spellings *of that fund type* (`pipeline/watchlist.py`); each match triggers the normal per-entity `discover_entity`, and only that enters the manifest. A firing therefore costs ~1 request plus one per fund that actually filed, independent of the watch-list size.
+
+Since an early-stopped read cannot assert identities against `recordsFiltered`, `scan_newest` validates the order it receives instead — non-increasing `dataEntrega`, no repeated identity, stable `recordsFiltered` — and any violation aborts with the cursor frozen (order violations are CRITICAL and exit 1; a `recordsFiltered` drift is legitimate re-filing shrinkage and aborts as a warning). The cursor advances only when the read was complete **and** every gated per-entity discovery succeeded; individual malformed rows never hold it back. Losing the cursor is harmless — the fallback is one full read of the monitor window. A failed read gates nothing and never falls back to per-entity discovery: the sweep is the designed backstop.
+
+**Every gate miss is absorbed by the sweep** — a rename, a new class, a spelling never learned, an empty `descricaoFundo` all cost latency, never a document. That is why `docker/scheduler.py` refuses `MONITOR_ENABLED=true` with `SWEEP_ENABLED=false` (exit 2), and why per-entity discovery refreshes `fnet_fund_description` from the newest row it sees, persisted through the normal digest-protected `funds.yaml` save: the gate matches against the stored spelling, and a rename never written back would blind it for that fund.
 
 `docker/scheduler.py` drives both from `MONITOR_SCHEDULE`/`MONITOR_ENABLED` and `SWEEP_SCHEDULE`/`SWEEP_ENABLED`, with `RUN_ON_START` naming the catch-up profile (`sweep`, because a start follows a restart or downtime — the gap case, which the monitor cannot see). The loop is serial, so a firing landing mid-run is skipped rather than queued and the profiles never contend for the lock; when both match one minute the sweep wins, being the superset. `RUN_SCHEDULE` and `RUN_ON_START=true|false` are the retired spellings, still read as `SWEEP_SCHEDULE` and `sweep|none` and warned about: a deployment already running must not be silently rescheduled.
 
@@ -96,13 +101,15 @@ Consequences worth knowing:
 
 **The work is split across `fetch` on purpose.** `detect` runs *before* fetching and cancels a loser that was never downloaded, so the run does not fetch a file it is about to delete. `sweep` runs *after*, and deletes a loser's file **only once its winner is `available`** — a replacement that failed to download leaves the original in place, because one readable copy beats none.
 
-`local_state` gains `superseded`, distinct from `purged`: `purged` has to keep meaning "aged past the retention frontier" and nothing else, or the archive can no longer explain why a file is gone. The row is never deleted, and `superseded_by_id`/`superseded_by_version` (manifest schema version 2) record what replaced it.
+`local_state` gains `superseded`, distinct from `purged`: `purged` has to keep meaning "aged past the retention frontier" and nothing else, or the archive can no longer explain why a file is gone. The row is never deleted, and `superseded_by_id`/`superseded_by_version` (added in manifest schema version 2) record what replaced it.
+
+**Manifest schema changes rebuild, never migrate.** `manifest/schema.sql` is the single definition of the schema; on an older `PRAGMA user_version` the database is deleted (with its `-wal`/`-shm` sidecars) and recreated, with a visible WARNING. The manifest is sliding-window state the next runs re-derive from the source, so a rebuild costs one window of idempotent re-work and a transient staleness warning until the next sweep — never an archived file. A *newer* on-disk version is still refused: upgrade the build, never downgrade the database.
 
 The inbox index follows: the body lists live versions only, and a trailing `## Superseded versions` section names the replaced ones without links, since their files are gone. **Every in-window index is regenerated each run**, not just today's — a document downloaded on Monday can be superseded on Wednesday, and Monday's index would otherwise keep a link to a deleted file. A past day's index is only *rewritten*, never invented: a first run must not fabricate indexes for days the robot was not there for.
 
 ## The spec is the authority
 
-`arquitetura-fii-monitor-pipeline-a-rev3.md` is the source of truth. It defines *what* and *why*, never *how*.
+`arquitetura-fii-monitor-pipeline-a-rev4.md` is the source of truth. It defines *what* and *why*, never *how*. Revision 4 differs from revision 3 in one area only: the two run profiles and the monitor's listing-gated discovery (§4.7), with the amendments to §4.2, §4.3, §4.5 and §4.6 that carry them. `monitor-discovery-analysis.md` is the dated design note behind that change — background, never authority.
 
 - Requirements marked **Invariante** cannot be violated.
 - Section 10 explicitly grants the implementer freedom over language and runtime, module structure, HTTP/YAML/persistence libraries, scheduling and packaging, logging and observability, CLI framework, test strategy, concurrency (within rate limits), exact database schema and migrations, and the exact format of the `_inbox` index.
@@ -139,7 +146,7 @@ The table is illustrative of the rule, not exhaustive. Anything the spec names i
 
 ## Non-negotiable invariants
 
-Section pointers refer to `arquitetura-fii-monitor-pipeline-a-rev3.md`.
+Section pointers refer to `arquitetura-fii-monitor-pipeline-a-rev4.md`.
 
 - **Publication identity is `(document_id, version)`** — never the document id alone. That pair is the key for dedupe, idempotency, and the filename. The content hash serves integrity and audit and is **never** the dedupe key (§2.4).
 - **Discovery queries per entity with `idFundo`** — never by matching `descricaoFundo` text. The listing returns `cnpjFundo` and `idFundo` as `null` on every row, even when filtering by `idFundo`, so text routing is a silent failure mode; revision 3 reverted to per-entity queries precisely to kill it (§2.3, §4.1). The global listing is **detective-only audit**: it raises alerts, never routes a document into the archive and never serves as a discovery path (§4.5).

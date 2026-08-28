@@ -1,13 +1,12 @@
 services:
   watcher:
     image: ghcr.io/landlord7284/fii-docs-watcher:${IMAGE_TAG:-latest}
+    container_name: fii-docs-watcher
     restart: unless-stopped
     init: true
     env_file: .env
     volumes:
       - ./config.toml:/config/config.toml:ro
-      - fii-data:/data
+      - ${DATA_PATH:-./data}:/data
       - ${DOCUMENTS_PATH:-./documents}:/documents
     stop_grace_period: 180s
-volumes:
-  fii-data:

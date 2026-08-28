@@ -36,11 +36,11 @@ takes a profile flag and no numbers, and exits with a meaningful code. `run` is 
 on the daily sweep as its backstop — schedule both.
 
 ```cron
-10 5 * * *     cd /srv/fii && /srv/fii/.venv/bin/fii-docs-watcher run >> /var/log/fii.log 2>&1
-0 7-23 * * *   cd /srv/fii && /srv/fii/.venv/bin/fii-docs-watcher run --monitor >> /var/log/fii.log 2>&1
+0 8 * * *     cd /srv/fii && /srv/fii/.venv/bin/fii-docs-watcher run >> /var/log/fii.log 2>&1
+0 0,9-23 * * *   cd /srv/fii && /srv/fii/.venv/bin/fii-docs-watcher run --monitor >> /var/log/fii.log 2>&1
 ```
 
-### With Docker
+## Docker
 
 ```bash
 cp config.example.toml config.toml
@@ -62,8 +62,16 @@ Running a command inside the container that is already up skips the entrypoint a
 root, and what root writes there cannot be overwritten by the scheduled run afterwards. Pass the uid
 explicitly — worth an alias in `~/.zshrc` or `~/.bashrc`:
 
+### Alias - `~/.zshrc` or `~/.bashrc`
+
 ```bash
-alias fii='docker compose -f /path/to/compose.yaml exec -u 1000:1000 watcher fii-docs-watcher'
+alias <alias_name>='docker compose -f /path/to/compose.yaml exec -u 1000:1000 watcher fii-docs-watcher'
+```
+
+or
+
+```bash
+alias <alias_name>='docker exec -it -u 1000:1000 <container_name> fii-docs-watcher'
 ```
 
 Use the same numbers as `PUID`/`PGID` in `.env`. Set to `0`, the container runs as root and `-u` is
@@ -77,9 +85,9 @@ holds only what has no place in it:
 | `IMAGE_TAG` | Which published image to run. Pin a version to make updates deliberate. |
 | `DOCUMENTS_PATH` | Where the archive lands on the host. This is the directory you share. |
 | `PUID` / `PGID` | The uid and gid that own what the robot writes. |
-| `MONITOR_SCHEDULE` | When `run --monitor` fires: a 5-field cron expression, default `0 7-23 * * *`. |
+| `MONITOR_SCHEDULE` | When `run --monitor` fires. |
 | `MONITOR_ENABLED` | `false` drops the monitor entirely. Enabling it requires the sweep to stay enabled. |
-| `SWEEP_SCHEDULE` | When `run` fires, default `10 5 * * *`. |
+| `SWEEP_SCHEDULE` | When `run` fires. |
 | `SWEEP_ENABLED` | `false` drops the sweep entirely. |
 | `RUN_ON_START` | Which profile a container start runs: `sweep`, `monitor` or `none`. |
 
@@ -107,7 +115,7 @@ Two constraints the compose file already satisfies, worth knowing before you cha
 
 Inside the container `data_root` and `documents_root` are fixed at `/data` and `/documents` by the
 image, so those two keys in your `config.toml` have no effect there — the host side of the mapping
-is `DOCUMENTS_PATH`.
+is `DATA_PATH` and `DOCUMENTS_PATH`.
 
 ---
 

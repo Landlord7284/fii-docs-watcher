@@ -646,6 +646,102 @@ class TestUnwatchedEntities:
         assert repo.get(9001, 1).local_state == LocalState.PURGED
 
 
+class TestTheListingGatedMonitor:
+    """One firing of the frequent profile, end to end against the fake source.
+
+    The listing gates which per-entity queries the firing spends; it never
+    routes a document. These tests watch the boundary through the request log:
+    what was asked of the source is the whole difference between the profiles.
+    """
+
+    MONITORED = "HEDGE BRASIL SHOPPING FUNDO DE INVESTIMENTO IMOBILIÁRIO"
+    UNMONITORED_ID = 999
+
+    def _monitor_cycle(self, config, repo, scopes, client):
+        from fii_docs_watcher.clock import retention_window
+
+        discovery = discover.run_monitor(
+            client,
+            repo,
+            scopes,
+            retention_window(2),
+            page_length=config.source.page_length,
+            retention=retention_window(config.retention.days),
+        )
+        window = retention_window(config.retention.days)
+        supersede.detect(repo, window)
+        downloads = fetch.run(client, repo, config, scopes)
+        supersede.sweep(repo, config, window)
+        return discovery, downloads
+
+    def _searches(self, fake) -> list[str]:
+        return [e for e in fake.request_log if "pesquisarGerenciadorDocumentosDados" in e]
+
+    def test_a_firing_archives_the_monitored_fund_and_only_it(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        fake.add_documents(FUND_ID, [make_row(9201, fund=self.MONITORED)])
+        fake.add_documents(self.UNMONITORED_ID, [make_row(9202, fund="SOME OTHER FUND")])
+
+        discovery, downloads = self._monitor_cycle(config, repo, scopes, client)
+
+        # The monitored fund's document is on disk, filed as any sweep would.
+        assert discovery.documents_new == 1
+        assert downloads.downloaded == 1
+        assert (config.paths.documents_root / to_dir_name(today())).is_dir()
+        # The unmonitored fund cost nothing: no query, no manifest row.
+        assert not any(f"idFundo={self.UNMONITORED_ID}" in e for e in fake.request_log)
+        assert repo.get(9202, 1) is None
+        # No watermark -- the monitor window never reaches the frontier -- but
+        # the cursor is written, which is the monitor's own bookkeeping.
+        assert repo.watermark(FUND_ID) is None
+        assert repo.listing_cursor(1) is not None
+
+    def test_a_quiet_repeat_firing_costs_one_search_in_total(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        fake.add_documents(FUND_ID, [make_row(9203, fund=self.MONITORED)])
+        self._monitor_cycle(config, repo, scopes, client)
+        fake.request_log.clear()
+
+        discovery, downloads = self._monitor_cycle(config, repo, scopes, client)
+
+        assert downloads.downloaded == 0
+        assert len(self._searches(fake)) == 1
+        assert not any("idFundo" in e for e in self._searches(fake))
+
+    def test_a_new_document_costs_the_listing_plus_one_entity_query(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        fake.add_documents(
+            FUND_ID, [make_row(9204, fund=self.MONITORED, delivery_time="09:00")]
+        )
+        self._monitor_cycle(config, repo, scopes, client)
+        fake.add_documents(
+            FUND_ID, [make_row(9205, fund=self.MONITORED, delivery_time="11:45")]
+        )
+        fake.request_log.clear()
+
+        discovery, downloads = self._monitor_cycle(config, repo, scopes, client)
+
+        assert downloads.downloaded == 1
+        searches = self._searches(fake)
+        assert len(searches) == 2
+        assert sum(1 for e in searches if f"idFundo={FUND_ID}" in e) == 1
+
+    def test_the_daily_sweep_afterwards_behaves_exactly_as_before(self, env) -> None:
+        config, fake, repo, scopes, client = env
+        from fii_docs_watcher.clock import retention_window
+
+        fake.add_documents(FUND_ID, [make_row(9206, fund=self.MONITORED)])
+        self._monitor_cycle(config, repo, scopes, client)
+
+        window = retention_window(config.retention.days)
+        sweep_discovery, sweep_downloads = _cycle(config, repo, scopes, client, window)
+
+        # Nothing re-downloaded, and the sweep still advances the watermark
+        # the monitor deliberately left alone.
+        assert sweep_downloads.downloaded == 0
+        assert repo.watermark(FUND_ID)["last_window_end"] == to_dir_name(window.last)
+
+
 class TestDescriptionRefresh:
     """Per-entity discovery keeps the stored Fundos.NET spelling current.
 

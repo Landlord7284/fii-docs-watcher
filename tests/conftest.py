@@ -109,6 +109,7 @@ def make_row(
     modality: str = "AP",
     status: str = "Ativo com visualização",
     reference: str = "07/2026",
+    delivery_time: str = "09:30",
 ) -> dict:
     """One listing row, shaped exactly like the live responses.
 
@@ -124,7 +125,7 @@ def make_row(
         "categoriaDocumento": category,
         "tipoDocumento": doc_type,
         "especieDocumento": species,
-        "dataEntrega": f"{delivery.strftime('%d/%m/%Y')} 09:30",
+        "dataEntrega": f"{delivery.strftime('%d/%m/%Y')} {delivery_time}",
         "dataReferencia": reference,
         "formatoDataReferencia": "2",
         "descricaoModalidade": "Apresentação",
@@ -222,9 +223,12 @@ class FakeFnet:
         if first and last:
             rows = [row for row in rows if first <= _row_date(row) <= last]
 
-        # The real endpoint only orders reliably by dataEntrega; mirror that so
-        # tests exercise the same code path the production sort relies on.
-        rows.sort(key=lambda r: (_row_date(r), r["id"]))
+        # The real endpoint only orders reliably by dataEntrega, in either
+        # direction; mirror that -- including the minute -- so tests of the
+        # newest-first stop rule exercise real descending data instead of
+        # passing vacuously against an ascending sort.
+        descending = params.get("o[0][dataEntrega]") == "desc"
+        rows.sort(key=lambda r: (_row_instant(r), r["id"]), reverse=descending)
 
         start = int(params.get("s", 0))
         length = int(params.get("l", 200))
@@ -290,6 +294,11 @@ def _parse_wire(value: str | None) -> date | None:
 
 def _row_date(row: dict) -> date:
     return _parse_wire(row["dataEntrega"][:10]) or date.min
+
+
+def _row_instant(row: dict) -> tuple[date, str]:
+    # (date, "HH:mm") -- the zero-padded time compares correctly as text.
+    return (_row_date(row), row["dataEntrega"][11:])
 
 
 @pytest.fixture

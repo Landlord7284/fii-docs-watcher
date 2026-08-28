@@ -22,7 +22,7 @@ from fii_docs_watcher.cvm.registry import servable_fund_types
 from fii_docs_watcher.errors import SourceContractError, TransientSourceError
 from fii_docs_watcher.fnet import funds as fnet_funds
 from fii_docs_watcher.fnet.client import FnetClient
-from fii_docs_watcher.fnet.listing import STABLE_SORT, scan
+from fii_docs_watcher.fnet.listing import NEWEST_FIRST_SORT, STABLE_SORT, scan
 
 LIVE_CONFIG = SourceConfig(min_request_interval_seconds=2.0, max_retries=3)
 
@@ -33,6 +33,15 @@ class TestEncodedFindings:
         # recordsFiltered of 217 while containing only 175 distinct ids -- 42
         # rows silently dropped. Sorting by dataEntrega returned all 217.
         assert STABLE_SORT == {"o[0][dataEntrega]": "asc"}
+
+    def test_the_newest_first_read_sorts_descending_and_the_scan_still_ascends(self) -> None:
+        # Measured 2026-08-27: descending on dataEntrega paginated a 333-row
+        # window cleanly (333 collected, 333 distinct, order non-increasing).
+        # Only the monitor's early-stopping read uses it -- and validates the
+        # order it receives, because an early stop cannot check coverage.
+        # Every full-coverage pagination stays on the ascending sort.
+        assert NEWEST_FIRST_SORT == {"o[0][dataEntrega]": "desc"}
+        assert STABLE_SORT["o[0][dataEntrega]"] == "asc"
 
     def test_the_page_length_ceiling_is_enforced_in_configuration(self) -> None:
         # Measured: l=200 honoured; l>=250 returns HTTP 500 even when politely

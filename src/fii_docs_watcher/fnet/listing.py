@@ -18,6 +18,14 @@ Measured, same window, same page size:
 So every request sends `o[0][dataEntrega]=asc`, and coverage is asserted on
 *distinct identities* rather than on the row count, which is the only check
 that would have caught this.
+
+The one exception is `scan_newest`, the monitor profile's newest-first read.
+Descending on `dataEntrega` was measured clean on 2026-08-27 (333/333 rows over
+a four-day window, order verified non-increasing, identical to the ascending
+set), but an early-stopped read cannot assert identities against
+`recordsFiltered` -- so it validates the ordering itself on every read and
+aborts on any violation instead. Every paginating full-coverage scan still
+sends `asc`.
 """
 
 from __future__ import annotations
@@ -25,7 +33,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from typing import Any
 
 from ..clock import to_wire_date
@@ -37,8 +45,11 @@ log = logging.getLogger(__name__)
 
 SEARCH_PATH = "pesquisarGerenciadorDocumentosDados"
 
-# The only ordering this endpoint honours. Changing it re-opens silent row loss.
+# The only ordering safe for full-coverage pagination. Changing it re-opens
+# silent row loss. `scan_newest` sends the descending counterpart and validates
+# the order it receives, because it cannot fall back on the coverage check.
 STABLE_SORT = {"o[0][dataEntrega]": "asc"}
+NEWEST_FIRST_SORT = {"o[0][dataEntrega]": "desc"}
 
 # `idTipoFundo` / `tipoFundo` = 1 selects real-estate funds. Other categories
 # answer under their own id and return nothing under this one, so the type
@@ -89,6 +100,7 @@ def _search_params(
     last: date,
     fundosnet_id: int | None,
     fund_type: int,
+    descending: bool = False,
 ) -> dict[str, Any]:
     """Build one search request.
 
@@ -107,7 +119,7 @@ def _search_params(
         "idTipoDocumento": 0,
         "idEspecieDocumento": 0,
         "isSession": "false",
-        **STABLE_SORT,
+        **(NEWEST_FIRST_SORT if descending else STABLE_SORT),
     }
     if fundosnet_id is not None:
         params["idFundo"] = fundosnet_id
@@ -170,6 +182,146 @@ def _pages(
         seen += len(batch)
         if not batch or seen >= total or len(batch) < page_length:
             return
+        start += page_length
+
+
+@dataclass
+class NewestReadResult:
+    """What one newest-first global read observed, and whether to trust it.
+
+    `complete` is the only field a caller may act on for state: it is true only
+    when the cursor frontier was crossed under validated descending order, or
+    the listing ended normally. A read that is not `complete` carries real rows,
+    but nothing derived from it -- least of all a cursor -- may advance.
+    """
+
+    rows: list[DocumentRow] = field(default_factory=list)
+    newest: datetime | None = None
+    records_filtered: int = 0
+    pages: int = 0
+    row_errors: list[SourceContractError] = field(default_factory=list)
+    complete: bool = False
+    failure: str | None = None
+    # True when the descending contract itself broke (order violation or a
+    # repeated identity): the source changed under us, which is CRITICAL. False
+    # for a `recordsFiltered` drift, which a re-filing causes legitimately.
+    contract_broken: bool = False
+
+
+def scan_newest(
+    client: FnetClient,
+    *,
+    first: date,
+    last: date,
+    fund_type: int,
+    cursor: datetime | None,
+    page_length: int = 200,
+) -> NewestReadResult:
+    """Read the global listing newest-first, stopping once `cursor` is reached.
+
+    This is the monitor profile's discovery gate and nothing else: rows are
+    matched against the watch list to decide which per-entity queries to spend;
+    no row read here ever routes a document into the archive.
+
+    The stop rule: rows at or above the cursor instant are kept; the read ends
+    at the first row *strictly below* it. Rows tied at the cursor minute are
+    kept and paged past, so a tie group is never split -- `dataEntrega` resolves
+    to the minute and several documents can share the boundary instant.
+    Deduplication is on `(id, versao)`, never on the timestamp.
+
+    An early stop forfeits the identities-vs-`recordsFiltered` coverage check
+    that caught silent row loss in the ascending scan, so order validation is
+    the substitute, enforced on every read: `dataEntrega` must be non-increasing
+    within and across pages, no identity may repeat, and `recordsFiltered` must
+    hold still across the pages of one read. Any violation aborts the read with
+    `complete` false. There is no retry loop: an aborted or incomplete read
+    costs latency only -- the caller keeps its cursor frozen, the next firing
+    re-reads, and the daily sweep remains the completeness guarantee.
+    """
+    result = NewestReadResult()
+    seen_identities: set[tuple[int, int]] = set()
+    error_fingerprints: set[str] = set()
+    previous: datetime | None = None
+    seen_raw = 0
+    start = 0
+
+    while True:
+        payload = client.get(
+            SEARCH_PATH,
+            _search_params(
+                start=start,
+                length=page_length,
+                first=first,
+                last=last,
+                fundosnet_id=None,
+                fund_type=fund_type,
+                descending=True,
+            ),
+        ).json()
+        batch, total = _parse_search_payload(payload)
+        result.pages += 1
+
+        if result.pages == 1:
+            result.records_filtered = total
+        elif total != result.records_filtered:
+            # A re-filing removes the replaced version from the listing, so the
+            # total can legitimately shrink mid-read. Rows may have shifted
+            # between pages, so nothing about this read is trustworthy -- but
+            # nothing about the source is broken either.
+            result.failure = (
+                f"recordsFiltered changed mid-read ({result.records_filtered} -> {total})"
+            )
+            log.warning(
+                "newest-first read aborted; will re-read from the frozen cursor",
+                extra={"fund_type": fund_type, "failure": result.failure},
+            )
+            return result
+
+        rows, row_errors = parse_rows(batch)
+        for error in row_errors:
+            fingerprint = str(error.context.get("row_fingerprint", str(error)))
+            if fingerprint not in error_fingerprints:
+                error_fingerprints.add(fingerprint)
+                result.row_errors.append(error)
+
+        crossed = False
+        for row in rows:
+            if previous is not None and row.delivery_at > previous:
+                result.failure = (
+                    f"descending order violated: {row.delivery_at.isoformat()} after "
+                    f"{previous.isoformat()} (document {row.document_id})"
+                )
+            elif row.identity in seen_identities:
+                result.failure = (
+                    f"identity repeated across the read: {row.identity} -- "
+                    "the signature of unstable pagination"
+                )
+            if result.failure is not None:
+                result.contract_broken = True
+                log.critical(
+                    "newest-first read violated the descending contract; "
+                    "re-measure the source (pytest -m live) before trusting it",
+                    extra={"fund_type": fund_type, "failure": result.failure},
+                )
+                return result
+            previous = row.delivery_at
+            seen_identities.add(row.identity)
+            if result.newest is None or row.delivery_at > result.newest:
+                result.newest = row.delivery_at
+            if cursor is not None and row.delivery_at < cursor:
+                crossed = True
+            else:
+                result.rows.append(row)
+
+        seen_raw += len(batch)
+        if crossed:
+            result.complete = True
+            return result
+        if not batch or len(batch) < page_length or seen_raw >= result.records_filtered:
+            # The listing ended normally: everything above the cursor -- or the
+            # whole window, when there was no cursor -- has been seen.
+            result.complete = True
+            return result
         start += page_length
 
 

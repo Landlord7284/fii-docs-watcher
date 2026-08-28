@@ -286,7 +286,13 @@ def execute(
                     )
                     return report
 
-                report.discovery = discover.run(
+                # The composition root's one profile decision below this line.
+                # The monitor discovers through the listing gate: the listing
+                # gates which per-entity queries the firing spends; it never
+                # routes a document. The sweep queries every entity, always,
+                # and remains the completeness guarantee.
+                discover_profile = discover.run_monitor if monitor else discover.run
+                report.discovery = discover_profile(
                     client,
                     repo,
                     scopes,

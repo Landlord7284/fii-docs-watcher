@@ -66,10 +66,14 @@ def profiled(config: Config, monkeypatch: pytest.MonkeyPatch):
 
     seen: dict[str, object] = {"audits": 0}
 
-    def fake_discover(_client, _repo, _scopes, window, **_kwargs):
-        seen["discovery_window"] = window
-        seen["retention"] = _kwargs.get("retention")
-        return discover.DiscoveryReport()
+    def _record(entry: str):
+        def fake_discover(_client, _repo, _scopes, window, **_kwargs):
+            seen["discovery_entry"] = entry
+            seen["discovery_window"] = window
+            seen["retention"] = _kwargs.get("retention")
+            return discover.DiscoveryReport()
+
+        return fake_discover
 
     def fake_fetch(*_args, **_kwargs):
         return fetch.FetchReport()
@@ -80,7 +84,8 @@ def profiled(config: Config, monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setattr(run, "RegistryCache", _NoRegistry)
     monkeypatch.setattr(run, "FnetClient", _NoClient)
-    monkeypatch.setattr(run.discover, "run", fake_discover)
+    monkeypatch.setattr(run.discover, "run", _record("run"))
+    monkeypatch.setattr(run.discover, "run_monitor", _record("run_monitor"))
     monkeypatch.setattr(run.fetch, "run", fake_fetch)
     monkeypatch.setattr(run.audit, "run", fake_audit)
     return config, seen
@@ -130,6 +135,20 @@ class TestTheProfileSelectsOneThing:
         report = run.execute(config, monitor=True)
 
         assert report.discovery_window.last == report.window.last
+
+    def test_the_sweep_discovers_per_entity_and_the_monitor_through_the_gate(
+        self, profiled
+    ) -> None:
+        # The one profile decision at the composition root: which discovery
+        # entry point runs. Both receive the same shape of arguments.
+        config, seen = profiled
+
+        run.execute(config)
+        assert seen["discovery_entry"] == "run"
+
+        run.execute(config, monitor=True)
+        assert seen["discovery_entry"] == "run_monitor"
+        assert seen["retention"].days == 7
 
 
 class TestTheMonitorDoesNotAudit:

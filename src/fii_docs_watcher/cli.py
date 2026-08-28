@@ -131,10 +131,12 @@ def build_parser() -> argparse.ArgumentParser:
             "window per entity, download what is new, delete any version a re-filing has\n"
             "replaced, write the inbox index, purge past the frontier, then run the global\n"
             "audit.\n\n"
-            "There are two profiles. Plain `run` sweeps [discovery].days, which follows\n"
-            "[retention].days unless the config says otherwise. `run --monitor` sweeps the\n"
-            "narrower [discovery].monitor_days and skips the global audit, so it is cheap\n"
-            "enough to schedule often. Everything else is the same in both.\n\n"
+            "There are two profiles. Plain `run` sweeps [discovery].days per entity, which\n"
+            "follows [retention].days unless the config says otherwise. `run --monitor`\n"
+            "reads the listing newest-first over [discovery].monitor_days, stops at what a\n"
+            "cursor already accounted for, and queries per entity only the funds that\n"
+            "actually filed -- so a firing costs about one request however long the watch\n"
+            "list is. It also skips the global audit. Everything else is the same in both.\n\n"
             "Safe to run as often as you like: rediscovering a document updates its status\n"
             "and never downloads it again."
         ),
@@ -148,7 +150,10 @@ def build_parser() -> argparse.ArgumentParser:
     run_cmd.add_argument(
         "--monitor",
         action="store_true",
-        help="the frequent profile: sweep [discovery].monitor_days and skip the audit",
+        help=(
+            "the frequent profile: gate per-entity queries through a newest-first "
+            "listing read over [discovery].monitor_days, and skip the audit"
+        ),
     )
     run_cmd.add_argument(
         "--dry-run", action="store_true", help="resolve scopes and stop before discovery"

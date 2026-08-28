@@ -18,6 +18,15 @@ their own names. Asking per entity means the answer is known from the question.
 
 The watermark is a record of progress, not an input: losing it costs nothing,
 because the next run scans the whole window regardless.
+
+`run_monitor` is the frequent profile's variant and the one stated exception to
+the global listing being detective-only: one newest-first read per fund type
+*gates* which of these per-entity queries the firing spends -- it never routes
+a document. A row that matches a monitored name (exact, folded equality, within
+its own fund type) triggers the normal per-entity query above; a row the gate
+misses costs latency only, because the daily sweep still queries every entity
+unconditionally. The cursor is what makes the firing cost proportional to the
+publication rate instead of the watch list.
 """
 
 from __future__ import annotations
@@ -29,10 +38,12 @@ from dataclasses import dataclass, field
 from ..clock import RetentionWindow
 from ..errors import TransientSourceError, WatcherError
 from ..fnet.client import FnetClient
-from ..fnet.listing import scan
+from ..fnet.listing import scan, scan_newest
 from ..manifest.db import transaction
 from ..manifest.repo import ManifestRepo
 from ..scope.models import Entity, Scope
+from ..scope.resolver import normalize_name
+from . import watchlist
 
 log = logging.getLogger(__name__)
 
@@ -45,6 +56,10 @@ class DiscoveryReport:
     documents_new: int = 0
     incomplete_scans: int = 0
     invalid_rows: int = 0
+    # Newest-first reads that failed or broke the descending contract. Only
+    # run_monitor produces these; each one already means the sweep is the only
+    # thing covering that fund type until a later firing succeeds.
+    listing_read_failures: int = 0
     errors: list[str] = field(default_factory=list)
 
 
@@ -187,6 +202,180 @@ def run(
                     },
                 )
                 repo.record_entity_error(entity.fundosnet_id, str(exc))
+
+    return report
+
+
+def run_monitor(
+    client: FnetClient,
+    repo: ManifestRepo,
+    scopes: list[Scope],
+    window: RetentionWindow,
+    *,
+    page_length: int,
+    should_stop: object = None,
+    retention: RetentionWindow | None = None,
+) -> DiscoveryReport:
+    """Discover through the listing gate: the frequent profile's variant of `run`.
+
+    Stated deviation from the architecture's "global listing is detective-only"
+    rule, formalized in revision 4: the listing gates which per-entity queries
+    the monitor spends; it never routes a document. Per fund type in the watch
+    list, one newest-first read collects the rows the cursor has not accounted
+    for; rows matching a monitored name (folded, exact, within that type) gate
+    the normal `discover_entity` call, and only those per-entity results enter
+    the manifest. A gate miss costs latency only -- the daily sweep still
+    queries every entity unconditionally and remains the completeness guarantee.
+
+    The cursor advances only when both held: the read came back `complete`
+    (frontier crossed under validated descending order, or the listing ended
+    normally) *and* every per-entity discovery it gated concluded without
+    raising. Not advancing self-heals -- the next firing re-reads the same rows
+    and retries -- while advancing past a failed gated discovery would silently
+    hand the document to the sweep alone, forfeiting exactly the latency the
+    monitor exists to buy. Individual malformed rows do not hold the cursor
+    back: they are counted as accounted for, the same arithmetic as the
+    ascending scan's coverage, because one defective row must not poison the
+    cursor forever and the sweep absorbs whatever it named.
+
+    A failed read gates nothing and never falls back to per-entity discovery:
+    that would cost one request per entity at the exact moment the source is
+    unhealthy, and would keep alive the mechanism this one replaces.
+
+    The signature mirrors `run` so the composition root chooses between them
+    and nothing below it knows which profile is running.
+    """
+    report = DiscoveryReport()
+    covers_retention = retention is None or window.first <= retention.first
+
+    for scope in scopes:
+        if not scope.resolved:
+            log.error(
+                "scope has no resolved entities and will be skipped", extra={"scope": scope.label}
+            )
+
+    resolved = [scope for scope in scopes if scope.resolved]
+    names_by_type = watchlist.monitored_names(resolved)
+
+    for fund_type in watchlist.fund_types(resolved):
+        if callable(should_stop) and should_stop():
+            log.warning("stopping discovery early on request")
+            return report
+
+        cursor = repo.listing_cursor(fund_type)
+        try:
+            result = scan_newest(
+                client,
+                first=window.first,
+                last=window.last,
+                fund_type=fund_type,
+                cursor=cursor,
+                # Hardcoded like the audit's scan: the cost argument for the
+                # gate is sized at the endpoint's ceiling. [source].page_length
+                # keeps governing the per-entity queries below.
+                page_length=200,
+            )
+        except (TransientSourceError, WatcherError) as exc:
+            report.listing_read_failures += 1
+            report.errors.append(f"tipoFundo={fund_type}: newest-first read failed: {exc}")
+            log.log(
+                getattr(exc, "severity", logging.ERROR),
+                "newest-first read failed; the sweep covers this fund type",
+                extra={"fund_type": fund_type, "error": str(exc)},
+            )
+            continue
+
+        # Malformed rows: recorded exactly as the ascending scan records them
+        # (partial state, exit code 1), and counted as accounted for -- they
+        # never hold the cursor back, because one defective row must not
+        # poison it forever. A monitored fund it might have named is absorbed
+        # by the sweep.
+        report.invalid_rows += len(result.row_errors)
+        for error in result.row_errors:
+            message = f"tipoFundo={fund_type}: {error}"
+            report.errors.append(message)
+            log.error(
+                "listing row failed validation and was skipped",
+                extra={"fund_type": fund_type, "error": str(error)},
+            )
+
+        if not result.complete:
+            # scan_newest already logged the abort at its proper severity. Only
+            # a broken descending contract turns the exit code; a
+            # recordsFiltered drift is legitimate re-filing shrinkage and the
+            # next firing re-reads from the frozen cursor.
+            if result.contract_broken:
+                report.listing_read_failures += 1
+                report.errors.append(f"tipoFundo={fund_type}: {result.failure}")
+            continue
+
+        if cursor is None:
+            candidates = list(result.rows)
+        else:
+            above = [row for row in result.rows if row.delivery_at > cursor]
+            # Rows tied at the cursor minute re-appear on every read; only the
+            # identities the manifest does not know yet are new. (id, versao)
+            # decides, never the timestamp.
+            ties = [row for row in result.rows if row.delivery_at == cursor]
+            known = repo.known_identities([row.identity for row in ties])
+            candidates = above + [row for row in ties if row.identity not in known]
+
+        names = names_by_type.get(fund_type, {})
+        gated: dict[int, tuple[Scope, Entity]] = {}
+        for row in candidates:
+            for scope, entity in names.get(normalize_name(row.fund_description), []):
+                # One entity matched by several rows, or by both of its
+                # spellings, is queried once.
+                gated.setdefault(entity.fundosnet_id, (scope, entity))
+
+        all_gated_succeeded = True
+        for scope, entity in gated.values():
+            if callable(should_stop) and should_stop():
+                log.warning("stopping discovery early on request")
+                return report
+            try:
+                discover_entity(
+                    client,
+                    repo,
+                    scope=scope,
+                    entity=entity,
+                    window=window,
+                    page_length=page_length,
+                    report=report,
+                    covers_retention=covers_retention,
+                )
+                report.entities_scanned += 1
+            except (TransientSourceError, WatcherError) as exc:
+                all_gated_succeeded = False
+                report.entities_failed += 1
+                message = f"{scope.label}/{entity.fundosnet_id}: {exc}"
+                report.errors.append(message)
+                log.log(
+                    getattr(exc, "severity", logging.ERROR),
+                    "gated entity scan failed; the cursor stays put so the next firing retries",
+                    extra={
+                        "scope": scope.label,
+                        "fundosnet_id": entity.fundosnet_id,
+                        "error": str(exc),
+                    },
+                )
+                repo.record_entity_error(entity.fundosnet_id, str(exc))
+
+        advanced = all_gated_succeeded and result.newest is not None
+        if advanced:
+            assert result.newest is not None
+            repo.advance_listing_cursor(fund_type, result.newest)
+        log.info(
+            "newest-first read finished",
+            extra={
+                "fund_type": fund_type,
+                "pages": result.pages,
+                "rows": len(result.rows),
+                "candidates": len(candidates),
+                "gated_entities": len(gated),
+                "cursor_advanced": advanced,
+            },
+        )
 
     return report
 

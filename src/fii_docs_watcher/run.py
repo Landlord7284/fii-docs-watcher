@@ -86,6 +86,7 @@ class RunReport:
             self.discovery.entities_failed
             or self.discovery.incomplete_scans
             or self.discovery.invalid_rows
+            or self.discovery.listing_read_failures
         ):
             return ExitCode.PARTIAL
         if self.downloads and self.downloads.failed:

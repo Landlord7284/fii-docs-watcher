@@ -345,6 +345,29 @@ def due(schedules: dict[str, Schedule | None], moment: datetime) -> str | None:
     return None
 
 
+def startup_refusal(schedules: dict[str, Schedule | None]) -> str | None:
+    """Why this combination of schedules must not start, if it must not.
+
+    Both profiles off is a container that would run nothing while looking like
+    it works. The monitor without the sweep is subtler and worse: the monitor
+    discovers through a name gate whose every miss -- a rename, a new class,
+    a spelling never learned -- is absorbed by the sweep querying each entity
+    unconditionally. Without the sweep those misses stop being latency and
+    become losses, while the archive keeps looking current because the monitor
+    is filing documents hourly. The sweep alone remains fine: that is simply
+    the robot as it was before the monitor existed.
+    """
+    if not any(schedules.values()):
+        return "both profiles are disabled; this scheduler would never run anything"
+    if schedules.get("monitor") is not None and schedules.get("sweep") is None:
+        return (
+            "MONITOR_ENABLED=true requires the sweep: the daily sweep is the monitor's "
+            "completeness backstop, absorbing every document the name gate misses. "
+            "Re-enable SWEEP_ENABLED or disable the monitor"
+        )
+    return None
+
+
 def main() -> int:
     try:
         loaded = config.load()
@@ -368,10 +391,9 @@ def main() -> int:
         log.error("the schedule is not usable: %s", exc)
         return 2
 
-    if not any(schedules.values()):
-        # Both profiles off is a container that would run nothing while looking
-        # like it works, which is worse than refusing to start.
-        log.error("both profiles are disabled; this scheduler would never run anything")
+    refusal = startup_refusal(schedules)
+    if refusal is not None:
+        log.error(refusal)
         return 2
 
     runner = Runner()

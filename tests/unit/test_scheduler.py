@@ -288,6 +288,42 @@ class TestProfiles:
         assert scheduler._schedule_for("monitor", "", "0 7-23 * * *") is None
 
 
+class TestTheSweepIsMandatoryUnderTheMonitor:
+    """The sweep absorbs every document the monitor's name gate misses.
+
+    Disabling it under an enabled monitor turns those misses from latency into
+    losses -- while the archive keeps looking current, because the monitor is
+    still filing documents hourly. The scheduler refuses to start that way
+    (exit 2) rather than running an archive that quietly stopped being
+    complete.
+    """
+
+    def _schedules(self, *, sweep: str | None, monitor: str | None):
+        return {
+            "sweep": None if sweep is None else Schedule.parse(sweep),
+            "monitor": None if monitor is None else Schedule.parse(monitor),
+        }
+
+    def test_the_monitor_without_the_sweep_is_refused(self) -> None:
+        refusal = scheduler.startup_refusal(
+            self._schedules(sweep=None, monitor="0 7-23 * * *")
+        )
+        assert refusal is not None and "backstop" in refusal
+
+    def test_both_profiles_together_start(self) -> None:
+        schedules = self._schedules(sweep="10 5 * * *", monitor="0 7-23 * * *")
+        assert scheduler.startup_refusal(schedules) is None
+
+    def test_the_sweep_alone_still_starts(self) -> None:
+        # The robot as it was before the monitor existed.
+        schedules = self._schedules(sweep="10 5 * * *", monitor=None)
+        assert scheduler.startup_refusal(schedules) is None
+
+    def test_both_disabled_is_still_refused(self) -> None:
+        refusal = scheduler.startup_refusal(self._schedules(sweep=None, monitor=None))
+        assert refusal is not None and "disabled" in refusal
+
+
 class TestTheDeploymentThatPredatesTheProfiles:
     """RUN_SCHEDULE and RUN_ON_START=true are live in somebody's .env.
 

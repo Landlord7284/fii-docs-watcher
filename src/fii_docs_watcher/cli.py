@@ -24,7 +24,12 @@ from pathlib import Path
 from . import __version__
 from .clock import retention_window, to_dir_name, today
 from .config import CONFIG_SEARCH_PATH, Config, describe_source, load
-from .cvm.registry import RegistryCache, servable_fund_types
+from .cvm.registry import (
+    RegistryCache,
+    RegistryEntity,
+    RegistrySnapshot,
+    servable_fund_types,
+)
 from .errors import ConfigError, LockHeldError, WatcherError
 from .fnet.client import FnetClient
 from .logging_setup import configure
@@ -35,6 +40,7 @@ from .scope.cnpj import format_masked, is_valid, normalize
 from .scope.models import Scope, ScopeMode
 from .scope.resolver import resolve_scope
 from .scope.yaml_store import FundsFile
+from .text import fold_name
 
 log = logging.getLogger(__name__)
 
@@ -185,10 +191,6 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="monitor only this entity, not the fund's other classes",
     )
-    add_cmd.add_argument(
-        "--no-resolve", action="store_true", help="write the entry without contacting the sources"
-    )
-
     list_cmd = add_command(
         "list",
         "show registered funds, optionally narrowed by a search term",
@@ -372,10 +374,26 @@ def cmd_add(config: Config, args: argparse.Namespace) -> int:
     funds_file = FundsFile.load(config.paths.funds_file)
     mode = ScopeMode.THIS_ENTITY_ONLY if args.this_entity_only else ScopeMode.FUND_AND_CLASSES
 
+    # `add` writes the watch list and stops there; it never queries Fundos.NET.
+    # Turning a CNPJ into Fundos.NET ids costs one query per class against a
+    # source whose successful responses take a minute as often as not, so
+    # registering a fund used to mean waiting on what is really the next run's
+    # work -- and the next run resolves every unresolved scope anyway. The CVM
+    # registry is still read, because it is a local file once cached: it names
+    # back what was just registered and catches a mistyped CNPJ on the spot.
+    snapshot = RegistryCache(config.cvm, config.paths.cvm_cache).load(config.source.user_agent)
+
     cnpj_input = args.cnpj
     ticker = args.ticker
     if cnpj_input is None:
-        cnpj_input = _choose_by_name(config, args.name)
+        if snapshot is None:
+            print(
+                "error: the CVM registry is unavailable, so names cannot be searched. "
+                "Register by CNPJ instead: --cnpj ...",
+                file=sys.stderr,
+            )
+            return ExitCode.CONFIG
+        cnpj_input = _choose_by_name(snapshot, args.name)
         if cnpj_input is None:
             return ExitCode.CONFIG
         # Having just picked a fund by name, being asked for its ticker is the
@@ -411,37 +429,59 @@ def cmd_add(config: Config, args: argparse.Namespace) -> int:
             print(f"{format_masked(normalized)} is already registered; nothing to change.")
         return ExitCode.OK
 
-    if not args.no_resolve:
-        registry = RegistryCache(config.cvm, config.paths.cvm_cache)
-        snapshot = registry.load(config.source.user_agent)
-        if snapshot is None:
-            print(
-                "warning: no CVM registry snapshot available; the entry was written and will "
-                "be resolved on the next run",
-                file=sys.stderr,
-            )
-        else:
-            try:
-                with FnetClient(config.source) as client:
-                    resolve_scope(client, snapshot, scope)
-                funds_file.update_scope(scope)
-            except WatcherError as exc:
-                print(f"warning: could not resolve it now: {exc}", file=sys.stderr)
-
+    pending = _describe_from_registry(scope, snapshot) if snapshot is not None else []
+    funds_file.update_scope(scope)
     funds_file.save(backup=config.paths.funds_backup)
 
     print(f"Registered {scope.label} ({format_masked(normalized)}).")
-    for entity in scope.entities:
-        print(
-            f"  entity {format_masked(entity.cnpj)}  id={entity.fundosnet_id}  "
-            f"type={entity.fnet_fund_type}  {entity.fnet_fund_description[:60]}"
-        )
-    if not scope.entities:
-        print("  not yet resolved; the next run will complete it.")
+    if scope.legal_name and scope.legal_name != scope.label:
+        print(f"  {scope.legal_name}")
+    if scope.cvm_status:
+        print(f"  CVM {scope.cvm_code}, {scope.cvm_status}")
+    # A monoclass fund is its own only entity, so listing it would just repeat
+    # the two lines above. Several classes are worth spelling out: one CNPJ was
+    # typed and more than one thing is now being watched because of it.
+    if len(pending) > 1:
+        print(f"  {len(pending)} entities to monitor:")
+        for entity in pending:
+            print(f"    {format_masked(entity.cnpj)}  {entity.kind:<5}  {entity.legal_name[:60]}")
+    print("  Fundos.NET ids are resolved by the next run, or now with `resolve`.")
     return ExitCode.OK
 
 
-def _choose_by_name(config: Config, term: str) -> str | None:
+def _describe_from_registry(scope: Scope, snapshot: RegistrySnapshot) -> list[RegistryEntity]:
+    """Name a freshly registered scope from the local CVM registry.
+
+    Returns the entities the scope will be resolved into, so the user can see
+    what registering one CNPJ actually put on the watch list. Nothing here
+    reaches the network, which is the point: the confirmation is worth having
+    and it is free once the registry archive is cached.
+
+    A CNPJ the registry has never heard of is a warning rather than a refusal.
+    The snapshot is a daily file, so a fund registered the day it opens is
+    legitimately absent from it, and the user may know better than a
+    yesterday-old copy of the registry.
+    """
+    cnpj = scope.normalized_cnpj or ""
+    anchor, entities = snapshot.expand(cnpj)
+    if anchor is None:
+        print(
+            f"warning: the CVM registry holds no fund or class this robot can monitor under "
+            f"{format_masked(cnpj) or scope.cnpj}. It was registered anyway; check the number "
+            "if the next run cannot resolve it.",
+            file=sys.stderr,
+        )
+        return []
+
+    scope.legal_name = anchor.legal_name
+    scope.cvm_code = anchor.cvm_code
+    scope.cvm_status = anchor.situation
+    if scope.mode is ScopeMode.THIS_ENTITY_ONLY:
+        return [snapshot.lookup(cnpj) or anchor]
+    return entities
+
+
+def _choose_by_name(snapshot: RegistrySnapshot, term: str) -> str | None:
     """Interactive disambiguation, against the CVM registry rather than Fundos.NET.
 
     A scope is registered by CNPJ, and Fundos.NET never returns one -- so
@@ -450,16 +490,6 @@ def _choose_by_name(config: Config, term: str) -> str | None:
     is local: instant, instead of waiting on a source that stalls for a minute
     at a time.
     """
-    registry = RegistryCache(config.cvm, config.paths.cvm_cache)
-    snapshot = registry.load(config.source.user_agent)
-    if snapshot is None:
-        print(
-            "error: the CVM registry is unavailable, so names cannot be searched. "
-            "Register by CNPJ instead: --cnpj ...",
-            file=sys.stderr,
-        )
-        return None
-
     matches = snapshot.search_by_name(term)
     if not matches:
         print(f"No FII fund or class matched {term!r} in the CVM registry.", file=sys.stderr)
@@ -537,6 +567,25 @@ def _terminal_width() -> int:
 
 def _shorten(value: str, width: int) -> str:
     return value if len(value) <= width else value[: max(1, width - 1)] + "\u2026"
+
+
+def _display_order(scopes: list[Scope]) -> list[Scope]:
+    """Sort funds the way the reader scans them: alphabetically by ticker.
+
+    The ticker is the handle a person holds a fund by, so an unordered listing
+    is a linear search even when it fits on one screen. A fund with no ticker
+    has no handle to scan for and goes last, in name order; the CNPJ breaks any
+    remaining tie so the same watch list always prints in the same order.
+    """
+    return sorted(
+        scopes,
+        key=lambda scope: (
+            not scope.ticker,
+            (scope.ticker or "").upper(),
+            fold_name(scope.legal_name or ""),
+            scope.normalized_cnpj or "",
+        ),
+    )
 
 
 def _list_rows(scopes: list[Scope]) -> list[dict[str, str]]:
@@ -641,7 +690,7 @@ def cmd_list(config: Config, args: argparse.Namespace) -> int:
         print(f"No registered fund matches {query!r}. {len(all_scopes)} registered in total.")
         return ExitCode.OK
 
-    rows = _list_rows(scopes)
+    rows = _list_rows(_display_order(scopes))
     common, columns = _hoist_common(rows, _LIST_COLUMNS)
     entities = sum(len(scope.entities) for scope in scopes)
     print(f"\n{len(scopes)} fund(s), {entities} entity(ies)")

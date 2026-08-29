@@ -237,6 +237,9 @@ CNPJ monitors the fund and its active classes. Registering a *class* CNPJ monito
 `--name` searches the CVM registry (local, instant) and shows the CNPJ of each match, because
 Fundos.NET can search by name but never returns a CNPJ. After you pick, it offers to set a ticker.
 
+`add` writes the watch list and returns; it names the fund and the entities it covers, and the
+next `run` resolves their Fundos.NET ids. Use [`resolve`](#resolve) to do that straight away.
+
 Real-estate funds (FII) and FIAGRO can be registered. The other categories Fundos.NET publishes
 are a possible extension: enabling one costs an extra daily audit scan, and a category that files
 mostly structured documents needs `formats` widened beyond the `pdf` default to archive anything.
@@ -245,7 +248,6 @@ mostly structured documents needs `formats` widened beyond the `pdf` default to 
 |---|---|
 | `--ticker ABCD11` | Your annotation, used as the filename prefix. The robot never invents or validates it. |
 | `--this-entity-only` | Monitor only this entity, not the fund's other classes. |
-| `--no-resolve` | Write the entry without contacting the sources; the next `run` resolves it. |
 
 Re-running `add` on a CNPJ that is already registered updates the fields you own rather than
 refusing. To stop following a fund, see [`rm`](#rm-query).
@@ -263,8 +265,8 @@ fii-docs-watcher list 08756747
 The search covers ticker, legal name, Fundos.NET description and CNPJ digits, ignoring accents,
 case and punctuation.
 
-The output is a table, with anything every listed fund agrees on printed once above it rather than
-on every row. A fund with several classes gets one row per class.
+The output is a table ordered by ticker, with anything every listed fund agrees on printed once
+above it rather than on every row. A fund with several classes gets one row per class.
 
 `CONFIRMED` says whether a downloaded file has already proved that entity's CNPJ, and reads
 `not yet` until the first document arrives -- for every fund, however it was registered. Fundos.NET

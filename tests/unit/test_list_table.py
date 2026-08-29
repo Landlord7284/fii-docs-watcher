@@ -9,7 +9,13 @@ anywhere.
 
 from __future__ import annotations
 
-from fii_docs_watcher.cli import _LIST_COLUMNS, _hoist_common, _list_rows, _render_table
+from fii_docs_watcher.cli import (
+    _LIST_COLUMNS,
+    _display_order,
+    _hoist_common,
+    _list_rows,
+    _render_table,
+)
 from fii_docs_watcher.scope.models import Entity, ExpansionState, Scope, ScopeMode
 
 
@@ -97,3 +103,26 @@ def test_the_name_column_stops_shrinking_before_it_becomes_unreadable() -> None:
     name = lines[-1].rsplit("  ", 1)[-1]
     assert len(name) == 24 and name.endswith("\u2026")
     assert len(lines[-1]) > 40
+
+
+def test_funds_are_listed_in_alphabetical_ticker_order() -> None:
+    """The order a watch list happens to be written in is nobody's order."""
+    ordered = _display_order(
+        [
+            scope("XPML11", "11111111000111"),
+            scope("BTLG11", "22222222000122"),
+            scope("KNRI11", "12005956000165"),
+        ]
+    )
+
+    assert [s.ticker for s in ordered] == ["BTLG11", "KNRI11", "XPML11"]
+
+
+def test_a_fund_with_no_ticker_is_listed_after_the_ones_that_have_one() -> None:
+    """There is nothing to scan for on that row, so it does not belong in the
+    middle of the alphabet; among themselves those funds go by name."""
+    without_ticker = scope("", "33333333000133")
+    without_ticker.legal_name = "AAA FUNDO DE INVESTIMENTO IMOBILIÁRIO"
+    ordered = _display_order([without_ticker, scope("XPML11", "11111111000111")])
+
+    assert [s.ticker for s in ordered] == ["XPML11", ""]

@@ -1,8 +1,8 @@
 # fii-docs-watcher — command reference
 
-Downloads Brazilian real-estate fund (FII) documents from Fundos.NET every day and files them into
-per-day directories, so you can open today's folder and see what is new. It keeps a sliding window
-of `N` days and deletes anything older; it is a reading queue, not an archive.
+Downloads Brazilian real-estate fund (FII) and FIAGRO documents from Fundos.NET every day and files
+them into per-day directories, so you can open today's folder and see what is new. It keeps a
+sliding window of `N` days and deletes anything older; it is a reading queue, not an archive.
 
 ---
 
@@ -60,7 +60,7 @@ docker compose run --rm watcher add --name "fund name"   # interactive; a TTY is
 Those start a new container, which goes through the entrypoint and drops to `PUID:PGID` on its own.
 Running a command inside the container that is already up skips the entrypoint and therefore runs as
 root, and what root writes there cannot be overwritten by the scheduled run afterwards. Pass the uid
-explicitly — worth an alias in `~/.zshrc` or `~/.bashrc`:
+explicitly.
 
 ### Alias - `~/.zshrc` or `~/.bashrc`
 
@@ -84,18 +84,18 @@ holds only what has no place in it:
 |---|---|
 | `IMAGE_TAG` | Which published image to run. Pin a version to make updates deliberate. |
 | `DOCUMENTS_PATH` | Where the archive lands on the host. This is the directory you share. |
+| `DATA_PATH` | Where the private state lands on the host. Must be a local filesystem. |
 | `PUID` / `PGID` | The uid and gid that own what the robot writes. |
 | `MONITOR_SCHEDULE` | When `run --monitor` fires. |
 | `MONITOR_ENABLED` | `false` drops the monitor entirely. Enabling it requires the sweep to stay enabled. |
 | `SWEEP_SCHEDULE` | When `run` fires. |
-| `SWEEP_ENABLED` | `false` drops the sweep entirely. |
+| `SWEEP_ENABLED` | `false` drops the sweep — only valid with the monitor disabled too. |
 | `RUN_ON_START` | Which profile a container start runs: `sweep`, `monitor` or `none`. |
 
 Schedules live here; how many days each profile covers lives in `[discovery]` in `config.toml` —
 how often to look and how far back are different questions, and a change of cadence should not read
-like a change of coverage. Both expressions are read in the source's timezone, the same one
-directory names use, so a time here means what a directory name means. Five fields, not the
-six-field form whose first field is seconds.
+like a change of coverage. Both expressions are read in the source's timezone, so a time here means
+what a directory name means. Five fields, not the six-field form whose first field is seconds.
 
 The catch-up on start is the sweep, because a container start usually follows a restart, an update
 or downtime — the gap case, and the one the monitor's narrow window cannot see. Disabling both
@@ -107,8 +107,8 @@ always did.
 
 Two constraints the compose file already satisfies, worth knowing before you change it:
 
-- **`data_root` is a named volume, not a bind mount to a share.** SQLite in WAL mode and the run
-  lock both need a local filesystem.
+- **`data_root` must be on a local filesystem.** `DATA_PATH` is bind-mounted into `/data`, so point
+  it at local disk: SQLite in WAL mode and the run lock are both unreliable over SMB or NFS.
 - **`documents_root` must be a single mount.** Downloads are staged in `.tmp/` inside it so the
   final rename is atomic; mounting `.tmp/` or a date directory separately puts them on a different
   filesystem and the robot refuses to start.
@@ -168,7 +168,7 @@ There are no credentials anywhere: the source is public and unauthenticated.
 archived**: this is a reading queue for people, and the XML is the same filing in a machine-readable
 shape — Pipeline B downloads its own, so keeping it here buys nothing unless you want it yourself.
 
-Ask for both, and the robot keeps both:
+Ask for both:
 
 ```toml
 [download]
@@ -207,9 +207,11 @@ fii-docs-watcher run --skip-audit
 
 There are two profiles. Plain `run` sweeps `discovery.days` (which follows `retention.days` unless
 you say otherwise) and runs the global audit. `run --monitor` sweeps the narrower
-`discovery.monitor_days` and skips the audit, so it is cheap enough to schedule often. They differ
-in nothing else: the same queue is drained, the same index written, and purge and the retention
-frontier stay on `retention.days` in both.
+`discovery.monitor_days` and skips the audit. It also discovers differently: instead of querying
+every fund, it reads the listing newest-first and queries only the funds that actually filed since
+its last firing — which is what makes it cheap, and why a fund the listing does not match waits for
+the sweep. Otherwise the two are the same: the same queue is drained, the same index written, and
+purge and the retention frontier stay on `retention.days` in both.
 
 The daily sweep is worth keeping even under a frequent monitor, because frequency is not coverage: a
 two-day window sees today and yesterday however often it fires. What the sweep buys is the days a
@@ -240,9 +242,7 @@ Fundos.NET can search by name but never returns a CNPJ. After you pick, it offer
 `add` writes the watch list and returns; it names the fund and the entities it covers, and the
 next `run` resolves their Fundos.NET ids. Use [`resolve`](#resolve) to do that straight away.
 
-Real-estate funds (FII) and FIAGRO can be registered. The other categories Fundos.NET publishes
-are a possible extension: enabling one costs an extra daily audit scan, and a category that files
-mostly structured documents needs `formats` widened beyond the `pdf` default to archive anything.
+Real-estate funds (FII) and FIAGRO can be registered.
 
 | Flag | Effect |
 |---|---|
@@ -298,8 +298,8 @@ Manifest rows are kept either way: they are a record of what the source publishe
 following the fund, and they cost almost nothing.
 
 `--yes` skips the confirmation, which is what you want in a script. The previous watch list is
-saved as `funds.yaml.bak`, though note that is only one level deep: the next command that writes the
-file overwrites it.
+saved as `funds.yaml.bak`, though that is only one level deep: the next command that writes the file
+overwrites it.
 
 #### Removing a fund by editing `funds.yaml`
 
@@ -354,13 +354,15 @@ that discovery did not capture.
 
 ### `status`
 
-Retention window, both discovery windows and which profile sweeps each, document counts by state, and any entity whose last complete scan predates the
+Retention window, both discovery windows and which profile sweeps each, document counts by state,
+the monitor's listing cursor per fund type, and any entity whose last complete scan predates the
 retention frontier — documents in such a gap were published and purged without ever being seen, and
 cannot be recovered.
 
 States: `discovered` (queued) · `downloading` (in flight) · `available` (on disk) · `failed` (will
 retry) · `skipped` (not a configured format) · `abandoned` (its fund was removed from the watch
-list) · `purged` (aged out; the row is kept, the file is not).
+list) · `superseded` (a re-filing replaced it; the file is gone, the row records what replaced it) ·
+`purged` (aged out; the row is kept, the file is not).
 
 ### `doctor`
 
@@ -379,7 +381,8 @@ machine.**
 - **`purge`** — delete date directories older than the frontier now.
 - **`audit`** — scan the global listing for documents whose fund name matches a monitored scope but
   which discovery did not capture. **Detective only:** it never files a document and never fails
-  the job. A hit means a scope needs revalidating.
+  the job. A hit means a scope needs revalidating. It honours `audit.frequency`, so with `weekly`
+  or `never` set it may report that it is disabled rather than scanning.
 
 ---
 
@@ -390,9 +393,9 @@ documents_root/
   _inbox/
     2026-08-14.md                     what arrived today, with links
   2026-08-13/
-    ABCD11_Informes-Periodicos_1450363_V01.xml
+    ABCD11_Informes-Periodicos_1450363_V01.pdf
   2026-08-14/
-    ABCD11_Informes-Periodicos_1293424_V01.xml
+    ABCD11_Informes-Periodicos_1293424_V01.pdf
   .tmp/                               downloads in flight
 ```
 
@@ -401,9 +404,10 @@ After the machine has been off for three days, the new documents land in three p
 which is why `_inbox/<today>.md` exists: it lists what actually arrived today, wherever it was
 filed.
 
-Filenames are `{prefix}_{category}_{id}_V{version}.{ext}`. The version is part of the name because a
-re-filing can reuse the document id, and without it v2 would overwrite v1. The extension is decided
-by the file's actual content, never by what the server claimed.
+Filenames are `{prefix}_{category}_{id}_V{version}.{ext}`, with the document species inserted after
+the category when the source gives one that differs from it. The version is part of the name
+because a re-filing can reuse the document id, and without it v2 would overwrite v1. The extension
+is decided by the file's actual content, never by what the server claimed.
 
 When a fund re-files a document, only the corrected version is kept: the older file is deleted once
 the replacement is safely on disk, and the index lists it under **Superseded versions** at the end

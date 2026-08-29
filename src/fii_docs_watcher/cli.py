@@ -62,8 +62,8 @@ Configuration is discovered automatically, so --config is rarely needed:
   ./fii-docs-watcher.toml, ~/.config/fii-docs-watcher/config.toml.
 If none is found the built-in defaults are used and a warning says so.
 
-Any value can be overridden by environment: FII_WATCHER_<SECTION>_<KEY>,
-for example FII_WATCHER_RETENTION_DAYS=14.
+Any value except [source].timezone can be overridden by environment:
+FII_WATCHER_<SECTION>_<KEY>, for example FII_WATCHER_RETENTION_DAYS=14.
 
 Exit codes:
   0  clean

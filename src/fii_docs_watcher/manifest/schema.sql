@@ -45,7 +45,8 @@ CREATE TABLE IF NOT EXISTS documents (
     -- last known value, with no promise that it is still current.
     status                TEXT,
 
-    -- discovered | downloading | available | failed | purged | skipped | abandoned
+    -- discovered | downloading | available | failed | purged | skipped |
+    -- abandoned | superseded
     --
     -- `skipped`   the configured [download].formats exclude this document's
     --             format. Not a failure, not retried as one, and re-evaluated

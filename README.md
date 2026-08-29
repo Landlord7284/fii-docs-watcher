@@ -5,9 +5,9 @@ A robot that downloads Brazilian real-estate fund (FII) and FIAGRO documents fro
 you can open today's folder and see what is new.
 
 It keeps a sliding window of `N` days and deletes anything older: this is a reading queue, not a
-long-term archive. You register the funds you care about by CNPJ; each run queries the whole
-retention window per entity, downloads what it has not seen, writes an index of what arrived today,
-and purges past the frontier.
+long-term archive. You register the funds you care about by CNPJ; each run queries a window of
+recent days per fund, downloads what it has not seen, writes an index of what arrived today, and
+purges past the frontier.
 
 Documents are filed by **delivery date** (`dataEntrega`), not by download date, so a machine that
 was off for three days lands the backlog in the three past directories it belongs to.
@@ -61,8 +61,7 @@ docker compose up -d
 ```
 
 `config.toml` configures the robot in either mode; `.env` only parameterizes the container — the
-image tag, the host directory for the archive, the uid that owns it, and the schedule. There is no
-second set of settings to find.
+image tag, the host directories it writes to, the uid that owns them, and the schedules.
 
 The container runs both profiles of the same one-shot `run` on schedules of their own
 (`SWEEP_SCHEDULE`, daily; `MONITOR_SCHEDULE`, hourly through the publishing day). Every other
@@ -76,12 +75,7 @@ docker compose logs -f
 
 Those go through the entrypoint, which drops to `PUID:PGID` on its own. A command run inside the
 container that is already up skips it and runs as root, and what root writes there blocks the
-scheduled run, so pass the uid explicitly:
-
-```bash
-# ~/.zshrc or ~/.bashrc; same numbers as PUID/PGID in .env
-alias fii='docker compose -f /path/to/compose.yaml exec -u 1000:1000 watcher fii-docs-watcher'
-```
+scheduled run — [USAGE.md](USAGE.md) has the alias that avoids it.
 
 ## Documentation
 

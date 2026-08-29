@@ -24,15 +24,15 @@ days = 7
 # on today, and neither changes what the archive keeps -- purge, the index and
 # the frontier stay on [retention].days whichever profile ran.
 #
-# `days` is what `run` sweeps. Unset it and it follows [retention].days. It may 
-# never exceed retention: a sweep wider than the window rediscovers what 
+# `days` is what `run` sweeps. Unset it and it follows [retention].days. It may
+# never exceed retention: a sweep wider than the window rediscovers what
 # purge has already deleted, so it is refused rather than trimmed.
 days = 7
 
 # `monitor_days` is the window of `run --monitor` -- the frequent profile,
 # which reads the source's listing newest-first, stops at what it has already
 # accounted for, queries per entity only the funds that actually filed, and
-# skips the global audit. 
+# skips the global audit.
 monitor_days = 2
 
 [source]
@@ -61,7 +61,7 @@ read_timeout_seconds = 120.0
 connect_timeout_seconds = 15.0
 
 # Verified ceiling: l=200 is honoured, l>=250 returns HTTP 500. The endpoint
-# never truncates silently, so exceeding this fails loudly rather than quietly.
+# never truncates silently, so exceeding this fails loudly.
 page_length = 200
 
 # Courtesy pause between requests, and retry policy for a source with no SLA.
@@ -94,7 +94,7 @@ frequency = "daily"
 
 [download]
 # Which content formats to keep. `downloadDocumento` serves PDF and XML from the
-# same endpoint; only the PDF is kept by default. both:  formats = ["pdf", "xml"]
+# same endpoint; only the PDF is kept by default. For both: formats = ["pdf", "xml"]
 #
 # Documents declined this way are recorded in the manifest as `skipped`, not
 # lost: widening this list later picks them up on the next run, without needing

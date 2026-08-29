@@ -27,13 +27,13 @@ python -m fii_docs_watcher run --monitor   # the frequent profile: narrower wind
 
 **`USAGE.md` at the repo root is the user-facing command reference** — keep it in step with the CLI.
 
-Other subcommands: `list [QUERY]`, `rm QUERY`, `ticker QUERY`, `resolve`, `reconcile`, `purge`, `audit`, `status`. `run` takes `--monitor` for the frequent profile; `doctor` and `status` print both discovery windows and which profile sweeps each. Exit codes: `0` clean, `1` ran with isolated failures, `2` bad configuration, `3` another instance holds the lock.
+Other subcommands: `list [QUERY]`, `rm QUERY`, `ticker QUERY`, `resolve`, `reconcile`, `purge`, `audit`, `status`. `doctor` and `status` print both discovery windows and which profile sweeps each. Exit codes: `0` clean, `1` ran with isolated failures, `2` bad configuration, `3` another instance holds the lock.
 
 ## Container packaging
 
 `Dockerfile`, `compose.yaml`, `.env.example` and `docker/` package the robot as an image published to GHCR by `.github/workflows/docker-publish.yml`. Nothing in the package knows about any of it — §7's portability rule holds, and the image is one way to run the same one-shot CLI.
 
-**`config.toml` is the application's configuration in both modes**, mounted at `/config/config.toml` in the container and native on a host. `.env` carries only what has no TOML counterpart: `IMAGE_TAG`, `DOCUMENTS_PATH`, `PUID`/`PGID`, the two schedules and their enable flags, and `RUN_ON_START`. Do not grow `.env.example` into a second copy of the settings — a config file plus targeted `FII_WATCHER_*` overrides is the arrangement; two parallel documented surfaces is not, and one of them would inevitably drift.
+**`config.toml` is the application's configuration in both modes**, mounted at `/config/config.toml` in the container and native on a host. `.env` carries only what has no TOML counterpart: `IMAGE_TAG`, `DOCUMENTS_PATH`, `DATA_PATH`, `PUID`/`PGID`, the two schedules and their enable flags, and `RUN_ON_START`. `DATA_PATH` is a bind mount, not a named volume, so §5.1's "local filesystem" requirement is the operator's to honour and is stated wherever the variable is documented. Do not grow `.env.example` into a second copy of the settings — a config file plus targeted `FII_WATCHER_*` overrides is the arrangement; two parallel documented surfaces is not, and one of them would inevitably drift.
 
 The image pins `FII_WATCHER_PATHS_DATA_ROOT=/data` and `FII_WATCHER_PATHS_DOCUMENTS_ROOT=/documents`, so those two keys in a mounted config are inert. That is deliberate: the container paths follow from the volume layout, and a user who copied the example without repointing `./var/…` would otherwise write the archive into the container's ephemeral layer and lose it on the next recreate.
 
@@ -142,7 +142,7 @@ The spec names things in Portuguese. Translate them; do not transliterate. This 
 | `expansao: parcial` | `expansion: partial` |
 | `{prefixo_entidade}` in filenames | `{entity_prefix}` |
 
-The table is illustrative of the rule, not exhaustive. Anything the spec names in Portuguese and this table omits still gets an English name.
+Anything the spec names in Portuguese and this table omits still gets an English name.
 
 ## Non-negotiable invariants
 
@@ -150,7 +150,7 @@ Section pointers refer to `arquitetura-fii-monitor-pipeline-a-rev4.md`.
 
 - **Publication identity is `(document_id, version)`** — never the document id alone. That pair is the key for dedupe, idempotency, and the filename. The content hash serves integrity and audit and is **never** the dedupe key (§2.4).
 - **Discovery queries per entity with `idFundo`** — never by matching `descricaoFundo` text. The listing returns `cnpjFundo` and `idFundo` as `null` on every row, even when filtering by `idFundo`, so text routing is a silent failure mode; revision 3 reverted to per-entity queries precisely to kill it (§2.3, §4.1). The global listing is **detective-only audit**: it raises alerts, never routes a document into the archive and never serves as a discovery path (§4.5).
-- **Every run queries its whole discovery window** `[today - (N-1), today]` per entity. There is no incremental interval. The watermark records completed progress and raises alerts; it is not an input to the interval calculation (§4.2, §4.3). Two windows exist and both end on the same `today`: purge, the inbox and the frontier keep the **retention** window, while discovery sweeps `[discovery].days` under `run` and `[discovery].monitor_days` under `run --monitor` — see "Two run profiles" below.
+- **Every run queries its whole discovery window** `[today - (N-1), today]` per entity. There is no incremental interval. The watermark records completed progress and raises alerts; it is not an input to the interval calculation (§4.2, §4.3). Two windows exist and both end on the same `today`: purge, the inbox and the frontier keep the **retention** window, while discovery sweeps `[discovery].days` under `run` and `[discovery].monitor_days` under `run --monitor`.
 - **Rediscovered documents update mutable fields and never trigger a re-download.** `status` in the manifest means "last state observed inside the retention window" (§4.2).
 - **The stored extension is decided by the actual response**, in this order of confidence: content signature (decisive) > `Content-Disposition` > `Content-Type` (least reliable). The "Estruturado" heuristic is for *early routing* only (§2.5).
 - **Validate content; a successful parse is not enough.** Recognize PDF by the `%PDF-` signature; require a plausible root for XML; explicitly reject an `html` root and error-page bodies even when well-formed; parse with external entity resolution disabled; cap response size; treat unrecognized content as a noisy failure and never write it silently. HTTP 200 with an HTML error body is a real failure mode in this system (§2.5, §8).
@@ -227,4 +227,3 @@ Wire-schema facts worth not re-deriving: `fundoOuClasse` is now overwhelmingly `
 - Parsing document contents — that is Pipeline B.
 - Long-term preservation. This is a sliding N-day window, not an archive.
 - **B3 trading ticker resolution — a closed decision.** No native source exists in CVM or Fundos.NET data (verified across the FCA, the Open Data Portal monthly-report CSVs, and the structured monthly report XML, which carries only `CodigoISIN`). Do not introduce an external dependency for it.
-- Correlating a document with its later re-filing when they arrive under different ids — "logical correlation", as distinct from publication identity (§1, §2.4). **No longer true** — see "Only the live version is kept" above; the spec's own cross-reference to "6.1" here is dangling anyway, since section 6 has no subsections.
